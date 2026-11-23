@@ -1,0 +1,30 @@
+d3d9-hle
+Copyright 2026 the d3d9-hle authors
+
+This product is licensed under the Apache License, Version 2.0 (LICENSE).
+
+Third-party and upstream material
+---------------------------------
+
+pcrecomp (https://github.com/sp00nznet/pcrecomp), MIT, Copyright (c) 2026 sp00nz.
+  The small Win32 host layer this library runs on started in pcrecomp and was
+  extended here: win32hle.h, host.h, recomp_types.h, host_lite.c, guest_mem.c,
+  hle_path.c, kernel32.c, kernel32_crt.c, gdi32.c, gdidc.c, ole32.c. The first
+  versions of the Direct3D 9 and D3DX9 shims also came from there. Material
+  derived from pcrecomp stays available under the MIT terms; the licence text
+  is in LICENSES/MIT-pcrecomp.txt. New contributions here are Apache-2.0.
+
+Wine (https://www.winehq.org/), LGPL-2.1-or-later.
+  No Wine source code is copied into this repository. The public Wine
+  specification files and the public Microsoft documentation were used as
+  references for names, ordinals and behaviour. Wine's own DLLs, if you use
+  them for comparison, stay separate programs under their own licence.
+
+vkd3d-shader (https://gitlab.winehq.org/wine/vkd3d), LGPL-2.1-or-later.
+  Optional. Loaded at run time with dlopen only when HLE_VKD3D_SHADER points to
+  it, to compile HLSL. It is not part of this repository and not linked in.
+
+SDL2 and SDL2_ttf (https://libsdl.org), zlib licence. Used as system libraries.
+
+Direct3D, DirectX, D3DX and Windows are trademarks of Microsoft. This project
+is not affiliated with or endorsed by Microsoft. It contains no Microsoft code.

@@ -89,14 +89,51 @@ int main(void) {
     d.alpha_test_enable = 1; d.alpha_func = D3D9_CMP_GREATEREQUAL; d.alpha_ref = 128;
     check_case("alpha test >=", &d, 1, "discard_fragment");
 
-    /* unsupported cases */
+    /* NORMAL is now supported (needed for CAMERASPACE texgen). */
     memset(&d, 0, sizeof d);
     d.fvf = D3D9_FVF_XYZ | D3D9_FVF_NORMAL;
-    check_case("normal unsupported", &d, 0, NULL);
+    check_case("xyz+normal unlit", &d, 1, "_csNormal");
+
+    /* CAMERASPACE texgen modes require a normal in the FVF. */
+    {
+        d3d9_ffp_stage_t cs = { D3D9_TEXOP_SELECTARG1, D3D9_TA_TEXTURE, 0,
+                                D3D9_TEXOP_SELECTARG1, D3D9_TA_TEXTURE, 0 };
+        cs.texcoord_index = D3D9_TCI_CAMERASPACENORMAL;
+        memset(&d, 0, sizeof d);
+        d.fvf = D3D9_FVF_XYZ; d.stages = &cs; d.stage_count = 1;
+        check_case("camera-space normal without FVF normal -> honest error", &d, 0, NULL);
+
+        d.fvf = D3D9_FVF_XYZ | D3D9_FVF_NORMAL;
+        check_case("camera-space normal", &d, 1, "_csNormal");
+        cs.texcoord_index = D3D9_TCI_CAMERASPACEPOSITION;
+        check_case("camera-space position", &d, 1, "_csPos");
+        cs.texcoord_index = D3D9_TCI_CAMERASPACEREFLECTIONVECTOR;
+        check_case("camera-space reflection", &d, 1, "reflect");
+        cs.texcoord_index = D3D9_TCI_SPHEREMAP;
+        check_case("sphere map", &d, 1, "_sm");
+
+        /* TEXTURETRANSFORMFLAGS COUNT1..4 with PROJECTED: divisor depends on count. */
+        cs.texcoord_index = 0;
+        cs.texture_transform_flags = D3D9_TTFF_COUNT2 | D3D9_TTFF_PROJECTED;
+        check_case("COUNT2|PROJECTED divides by _t.y", &d, 1, "_div = _t.y");
+        cs.texture_transform_flags = D3D9_TTFF_COUNT3 | D3D9_TTFF_PROJECTED;
+        check_case("COUNT3|PROJECTED divides by _t.z", &d, 1, "_div = _t.z");
+        cs.texture_transform_flags = D3D9_TTFF_COUNT4 | D3D9_TTFF_PROJECTED;
+        check_case("COUNT4|PROJECTED divides by _t.w", &d, 1, "_div = _t.w");
+    }
+
+    /* lighting and normal supported */
+    memset(&d, 0, sizeof d);
+    d.fvf = D3D9_FVF_XYZ | D3D9_FVF_NORMAL;
+    d.lighting = 1;
+    check_case("xyz+normal lit", &d, 1, "lit_diff");
 
     memset(&d, 0, sizeof d);
-    d.fvf = D3D9_FVF_XYZ; d.lighting = 1;
-    check_case("lighting unsupported", &d, 0, NULL);
+    d.fvf = D3D9_FVF_XYZ | D3D9_FVF_NORMAL | D3D9_FVF_DIFFUSE;
+    d.lighting = 1;
+    d.specular_enable = 1;
+    d.color_vertex = 1;
+    check_case("xyz+normal+diffuse lit specular", &d, 1, "lit_spec");
 
     printf("d3d9_ffp_selftest: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

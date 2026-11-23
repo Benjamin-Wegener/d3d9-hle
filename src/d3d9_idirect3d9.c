@@ -156,7 +156,14 @@ void d9_CreateDevice(void) {
     init_d3d9_vtables();
 
     d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)calloc(1, sizeof(*ctx));
+    /* Public D3D9 defaults the HLE cannot take from zero-init:
+     * D3DRS_COLORWRITEENABLE* default to 0xF (MSDN "Saving Pixel State"). */
+    ctx->render_states[D3DRS_COLORWRITEENABLE] = 0xFu;
+    ctx->render_states[D3DRS_COLORWRITEENABLE1] = 0xFu;
+    ctx->render_states[D3DRS_COLORWRITEENABLE2] = 0xFu;
+    ctx->render_states[D3DRS_COLORWRITEENABLE3] = 0xFu;
     ctx->d3d9_obj = self;
+    ctx->cursor_visible = 1;
     ctx->adapter = adapter;
     ctx->dev_type = dev_type;
     ctx->focus_window = focus_window;
@@ -185,6 +192,12 @@ void d9_CreateDevice(void) {
             }
         }
     }
+    /* D3DTSS_CONSTANT defaults to 0xFFFFFFFF (D3D9). */
+    for (int st = 0; st < MAX_TEXTURE_STAGES; st++)
+        for (int ty = 0; ty < MAX_TSS; ty++)
+            ctx->texture_stage_states[st][ty] = 0;
+    for (int st = 0; st < MAX_TEXTURE_STAGES; st++)
+        ctx->texture_stage_states[st][32] = 0xFFFFFFFFu;
 
     /* Allocate device COM object in guest memory */
     uint32_t o = hle_com_new(g_vt_device9, 16);

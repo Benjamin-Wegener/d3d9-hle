@@ -50,9 +50,9 @@ int main(void) {
     call("IDirect3DVertexBuffer9::Lock",5,(uint32_t[]){*pvb,0,sz,A(pdata),0});
     V *v=(V*)hle_ptr(*pdata);
     /* Triangle with a diagonal edge through the centre of the target. */
-    v[0]=cv(-1.0f,-1.0f,0xFFFF0000u);
-    v[1]=cv( 1.0f,-1.0f,0xFFFF0000u);
-    v[2]=cv(-1.0f, 1.0f,0xFFFF0000u);
+    v[0]=cv( 0.0f, 0.0f,0xFFFF0000u);
+    v[1]=cv(32.0f, 0.0f,0xFFFF0000u);
+    v[2]=cv( 0.0f,32.0f,0xFFFF0000u);
     call("IDirect3DVertexBuffer9::Unlock",1,(uint32_t[]){*pvb});
     call("IDirect3DDevice9::SetStreamSource",5,(uint32_t[]){dev,0,*pvb,0,sz});
     call("IDirect3DDevice9::SetFVF",2,(uint32_t[]){dev,0x44u /* XYZRHW|DIFFUSE */});
@@ -68,7 +68,7 @@ int main(void) {
     uint32_t pixels[W*H];
     ok("Metal readback resolves MSAA", hle_d3d9_metal_read_pixels(0,0,W,H,pixels,W*4)==0);
     const uint32_t *rx=pixels;
-    uint32_t inside=rx[24*W+8], outside=rx[8*W+24];
+    uint32_t inside=rx[8*W+8], outside=rx[24*W+24];
     printf("    inside=0x%08X outside=0x%08X\n",inside,outside);
     ok("triangle interior is red",inside==0xFFFF0000u);
     ok("triangle exterior is green",outside==0xFF00FF00u);

@@ -7,6 +7,11 @@
  * do not link. A weak fallback keeps those builds linkable; the real .m
  * definition overrides it in the game. */
 __attribute__((weak)) uint64_t hle_d3d9_metal_working_set_bytes(void) { return 0; }
+/* Mock-GPU selftests do not link d3d9_metal.m either; keep Present linkable. */
+__attribute__((weak)) void hle_d3d9_metal_set_present_params(const int32_t src[4],
+                                                             const int32_t dst[4],
+                                                             uint32_t fullscreen)
+{ (void)src; (void)dst; (void)fullscreen; }
 
 /* D3DRENDERSTATETYPE / D3DBLEND / D3DCULL / D3DCMP values, public D3D9 enums. */
 #define D3DRS_ZENABLE         7u
@@ -21,8 +26,17 @@ __attribute__((weak)) uint64_t hle_d3d9_metal_working_set_bytes(void) { return 0
 #define D3DRS_FOGSTART       36u
 #define D3DRS_FOGEND         37u
 #define D3DRS_FOGDENSITY     38u
+#define D3DRS_SPECULARENABLE 29u
 #define D3DRS_LIGHTING       137u
+#define D3DRS_AMBIENT        139u
 #define D3DRS_FOGVERTEXMODE  140u
+#define D3DRS_COLORVERTEX    141u
+#define D3DRS_LOCALVIEWER    142u
+#define D3DRS_NORMALIZENORMALS 143u
+#define D3DRS_DIFFUSEMATERIALSOURCE  145u
+#define D3DRS_SPECULARMATERIALSOURCE 146u
+#define D3DRS_AMBIENTMATERIALSOURCE  147u
+#define D3DRS_EMISSIVEMATERIALSOURCE 148u
 #define D3DRS_CULLMODE       22u
 #define D3DRS_SRCBLEND       19u
 #define D3DRS_DESTBLEND      20u
@@ -259,8 +273,23 @@ void dev9_SetCursorProperties(void) {
     fprintf(stderr, "[d3d9] SetCursorProperties: no hardware cursor in HLE\n");
     RET(D3DERR_NOTAVAILABLE, 4);
 }
-void dev9_SetCursorPosition(void)   { RET(D3D_OK, 4); }
-void dev9_ShowCursor(void) { RET(1, 2); }
+void dev9_SetCursorPosition(void) {
+    /* Public D3D9 docs: void SetCursorPosition(UINT X, UINT Y, DWORD Flags).
+     * The HLE has no device cursor, so this is a documented no-op; EAX is
+     * undefined for void and the stdcall pop is 4 args including this. */
+    RET(0, 4);
+}
+void dev9_ShowCursor(void) {
+    /* Public D3D9 docs: BOOL ShowCursor(BOOL bShow) returns the PREVIOUS
+     * visibility state. Track it per device instead of a constant 1. The host
+     * SDL cursor is not changed: only the reported device state is honest. */
+    uint32_t self = A32(0), show = A32(1);
+    d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)OBJ_CTX(self);
+    if (!ctx) RET(0, 2);
+    uint32_t prev = ctx->cursor_visible;
+    ctx->cursor_visible = show ? 1u : 0u;
+    RET(prev, 2);
+}
 static uint32_t get_swapchain_ptr(d3d9_device_ctx_t *ctx, uint32_t i) {
     if (!ctx) return 0;
     if (i == 0) {
@@ -394,6 +423,11 @@ void dev9_Reset(void) {
     ctx->scissor_rect.y2 = (int32_t)ctx->viewport.Height;
 
     /* D3D9 Reset clears transforms to identity for all supported slots. */
+    for (int st = 0; st < MAX_TEXTURE_STAGES; st++)
+        for (int ty = 0; ty < MAX_TSS; ty++)
+            ctx->texture_stage_states[st][ty] = 0;
+    for (int st = 0; st < MAX_TEXTURE_STAGES; st++)
+        ctx->texture_stage_states[st][32] = 0xFFFFFFFFu;
     for (int t = 0; t < 512; t++) {
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++)
@@ -401,6 +435,11 @@ void dev9_Reset(void) {
     }
     /* ... and all render states to their defaults (D3DRS_DEFAULT). */
     memset(ctx->render_states, 0, sizeof(ctx->render_states));
+    /* Re-apply the public non-zero defaults (same as CreateDevice). */
+    ctx->render_states[D3DRS_COLORWRITEENABLE] = 0xFu;
+    ctx->render_states[D3DRS_COLORWRITEENABLE1] = 0xFu;
+    ctx->render_states[D3DRS_COLORWRITEENABLE2] = 0xFu;
+    ctx->render_states[D3DRS_COLORWRITEENABLE3] = 0xFu;
     if (ctx->dynamic_ib && hle_d3d9_gpu && hle_d3d9_gpu->destroy_buffer) {
         hle_d3d9_gpu->destroy_buffer(ctx->dynamic_ib);
         ctx->dynamic_ib = NULL;
@@ -425,12 +464,23 @@ void dev9_Reset(void) {
 }
 
 void dev9_Present(void) {
-    /* (this, pSrcRect, pDstRect, hDestWindowOverride, pDirtyRegion) */
+    /* (this, pSrcRect, pDstRect, hDestWindowOverride, pDirtyRegion)
+     * Public D3D9: pSrcRect/pDstRect are RECT {left,top,right,bottom}; NULL
+     * means the whole backbuffer / the whole client area. */
+    uint32_t pSrc = A32(1), pDst = A32(2), hOverride = A32(3);
     d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)OBJ_CTX(A32(0));
     if (ctx && ctx->device_state != D3D9_DEVICE_STATE_OK) {
         /* A lost or not-reset device fails presenting until it is reset back
          * to the operational state (public D3D9: Present -> D3DERR_DEVICELOST). */
         RET(D3DERR_DEVICELOST, 5);
+    }
+    {
+        int32_t src[4] = { 0, 0, 0, 0 }, dst[4] = { 0, 0, 0, 0 };
+        if (pSrc) memcpy(src, hle_ptr(pSrc), sizeof src);
+        if (pDst) memcpy(dst, hle_ptr(pDst), sizeof dst);
+        uint32_t fullscreen = ctx ? (ctx->pp.Windowed ? 0u : 1u) : 0u;
+        hle_d3d9_metal_set_present_params(src, dst, fullscreen);
+        (void)hOverride;
     }
     if (hle_d3d9_gpu && hle_d3d9_gpu->present) {
         hle_d3d9_gpu->present();
@@ -1313,6 +1363,7 @@ void dev9_SetLight(void) {
     if (!pLight || idx >= D3D9_MAX_LIGHTS) RET(D3DERR_INVALIDCALL, 3);
     d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)OBJ_CTX(self);
     memcpy(ctx->lights[idx], hle_ptr(pLight), D3D9_LIGHT_BYTES);
+    ctx->light_defined[idx] = 1;
     sb9_mark(ctx, SBK_LIGHT, idx, 1);
     RET(D3D_OK, 3);
 }
@@ -1320,6 +1371,7 @@ void dev9_GetLight(void) {
     uint32_t self = A32(0), idx = A32(1), pLight = A32(2);
     if (!pLight || idx >= D3D9_MAX_LIGHTS) RET(D3DERR_INVALIDCALL, 3);
     d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)OBJ_CTX(self);
+    if (!ctx->light_defined[idx]) RET(D3DERR_INVALIDCALL, 3);
     memcpy(hle_ptr(pLight), ctx->lights[idx], D3D9_LIGHT_BYTES);
     RET(D3D_OK, 3);
 }
@@ -1353,11 +1405,118 @@ void dev9_GetClipPlane(void) {
     RET(D3D_OK, 3);
 }
 
+/* Public-enum validation for dev9_SetRenderState (public docs:
+ * IDirect3DDevice9::SetRenderState returns D3DERR_INVALIDCALL when an
+ * argument is invalid; values are the public D3D9 ones, Wine 11.0
+ * include/d3d9types.h). */
+static int dev9_rs_valid(uint32_t state, uint32_t value) {
+    static const uint32_t cmp_funcs[] = {
+        D3DCMP_NEVER, D3DCMP_LESS, D3DCMP_EQUAL, D3DCMP_LESSEQUAL,
+        D3DCMP_GREATER, D3DCMP_NOTEQUAL, D3DCMP_GREATEREQUAL, D3DCMP_ALWAYS
+    };
+    static const uint32_t blends[] = {
+        D3DBLEND_ZERO, D3DBLEND_ONE, D3DBLEND_SRCCOLOR, D3DBLEND_INVSRCCOLOR,
+        D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_DESTALPHA,
+        D3DBLEND_INVDESTALPHA, D3DBLEND_DESTCOLOR, D3DBLEND_INVDESTCOLOR,
+        D3DBLEND_SRCALPHASAT, D3DBLEND_BOTHSRCALPHA, D3DBLEND_BOTHINVSRCALPHA,
+        D3DBLEND_BLENDFACTOR, D3DBLEND_INVBLENDFACTOR
+    };
+    static const uint32_t blend_ops[] = {
+        D3DBLENDOP_ADD, D3DBLENDOP_SUBTRACT, D3DBLENDOP_REVSUBTRACT,
+        D3DBLENDOP_MIN, D3DBLENDOP_MAX
+    };
+    static const uint32_t stencil_ops[] = {
+        D3DSTENCILOP_KEEP, D3DSTENCILOP_ZERO, D3DSTENCILOP_REPLACE,
+        D3DSTENCILOP_INCRSAT, D3DSTENCILOP_DECRSAT, D3DSTENCILOP_INVERT,
+        D3DSTENCILOP_INCR, D3DSTENCILOP_DECR
+    };
+    const uint32_t *tab;
+    uint32_t n, i;
+    switch (state) {
+        case D3DRS_SRCBLEND: case D3DRS_DESTBLEND:
+        case D3DRS_SRCBLENDALPHA: case D3DRS_DESTBLENDALPHA:
+        case D3DRS_BLENDOPALPHA:
+            tab = blends; n = sizeof blends / sizeof blends[0]; break;
+        case D3DRS_ZFUNC: case D3DRS_ALPHAFUNC:
+        case D3DRS_STENCILFUNC: case D3DRS_CCW_STENCILFUNC:
+            tab = cmp_funcs; n = sizeof cmp_funcs / sizeof cmp_funcs[0]; break;
+        case D3DRS_BLENDOP:
+            tab = blend_ops; n = sizeof blend_ops / sizeof blend_ops[0]; break;
+        case D3DRS_STENCILFAIL: case D3DRS_STENCILZFAIL: case D3DRS_STENCILPASS:
+        case D3DRS_CCW_STENCILFAIL: case D3DRS_CCW_STENCILZFAIL: case D3DRS_CCW_STENCILPASS:
+            tab = stencil_ops; n = sizeof stencil_ops / sizeof stencil_ops[0]; break;
+        case D3DRS_STENCILENABLE: case D3DRS_TWOSIDEDSTENCILMODE:
+        case D3DRS_ALPHATESTENABLE: case D3DRS_SEPARATEALPHABLENDENABLE:
+            return value <= 1;
+        case D3DRS_COLORWRITEENABLE: case D3DRS_COLORWRITEENABLE1:
+        case D3DRS_COLORWRITEENABLE2: case D3DRS_COLORWRITEENABLE3:
+            return (value & ~0xFu) == 0;
+        default:
+            return 1;
+    }
+    for (i = 0; i < n; i++) if (tab[i] == value) return 1;
+    return 0;
+}
+
+/* Draw-time honesty (public docs): the Metal backend cannot apply these
+ * combinations; drawing fails with D3DERR_NOTAVAILABLE and a log instead of
+ * a false OK. Alpha test is supported by the HLE's fixed-function pipeline. */
+static int dev9_draw_blocked(const d3d9_device_ctx_t *ctx) {
+    if (ctx->render_states[D3DRS_STENCILENABLE]) {
+        fprintf(stderr, "[d3d9] draw: stencil is not supported by the Metal backend\n");
+        return 1;
+    }
+    if (ctx->render_states[D3DRS_DEPTHBIAS]) {
+        fprintf(stderr, "[d3d9] draw: D3DRS_DEPTHBIAS is not supported by the Metal backend\n");
+        return 1;
+    }
+    if (ctx->render_states[D3DRS_SLOPESCALEDEPTHBIAS]) {
+        fprintf(stderr, "[d3d9] draw: D3DRS_SLOPESCALEDEPTHBIAS is not supported by the Metal backend\n");
+        return 1;
+    }
+    if (ctx->render_states[D3DRS_COLORWRITEENABLE] != 0xFu ||
+        ctx->render_states[D3DRS_COLORWRITEENABLE1] != 0xFu ||
+        ctx->render_states[D3DRS_COLORWRITEENABLE2] != 0xFu ||
+        ctx->render_states[D3DRS_COLORWRITEENABLE3] != 0xFu) {
+        fprintf(stderr, "[d3d9] draw: color write masks are not supported by the Metal backend\n");
+        return 1;
+    }
+    if (ctx->render_states[D3DRS_SEPARATEALPHABLENDENABLE]) {
+        /* Compare against the effective blend factors (same defaults the
+         * backend applies): a separate alpha setting equal to them is not
+         * a distinct request. */
+        uint32_t src_eff = ctx->render_states[D3DRS_SRCBLEND] ? ctx->render_states[D3DRS_SRCBLEND] : D3DBLEND_SRCALPHA;
+        uint32_t dst_eff = ctx->render_states[D3DRS_DESTBLEND] ? ctx->render_states[D3DRS_DESTBLEND] : D3DBLEND_INVSRCALPHA;
+        if (ctx->render_states[D3DRS_SRCBLENDALPHA] != src_eff ||
+            ctx->render_states[D3DRS_DESTBLENDALPHA] != dst_eff) {
+            fprintf(stderr, "[d3d9] draw: separate alpha blend factors are not supported by the Metal backend\n");
+            return 1;
+        }
+    }
+    /* BLENDOP's public default is D3DBLENDOP_ADD; the HLE stores 0 for unset. */
+    if (ctx->render_states[D3DRS_BLENDOP] &&
+        ctx->render_states[D3DRS_BLENDOP] != D3DBLENDOP_ADD) {
+        fprintf(stderr, "[d3d9] draw: D3DRS_BLENDOP != D3DBLENDOP_ADD is not supported by the Metal backend\n");
+        return 1;
+    }
+    if (ctx->render_states[D3DRS_SEPARATEALPHABLENDENABLE] &&
+        ctx->render_states[D3DRS_BLENDOPALPHA] &&
+        ctx->render_states[D3DRS_BLENDOPALPHA] != D3DBLENDOP_ADD) {
+        fprintf(stderr, "[d3d9] draw: D3DRS_BLENDOPALPHA is not supported by the Metal backend\n");
+        return 1;
+    }
+    return 0;
+}
+
 void dev9_SetRenderState(void) {
     uint32_t self = A32(0);
     uint32_t state = A32(1);
     uint32_t val = A32(2);
     d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)OBJ_CTX(self);
+    if (!dev9_rs_valid(state, val)) {
+        fprintf(stderr, "[d3d9] SetRenderState(state %u, value 0x%x): invalid value for state\n", state, val);
+        RET(D3DERR_INVALIDCALL, 3);
+    }
     if (state == 4034u /* D3DRS_SRGBWRITEENABLE */) {
         ctx->srgb_write = val ? 1u : 0u;
         hle_d3d9_metal_set_srgb_write((int)ctx->srgb_write);
@@ -1638,21 +1797,18 @@ static void mul_mat(const float *a, const float *b, float *out) {
     memcpy(out, r, sizeof(r));
 }
 
-typedef struct {
-    float mvp[16];
-    float fogColor[4];
-    float fogStart;
-    float fogEnd;
-    float fogDensity;
-    float _pad;
-    float world[16];   /* world-space user clip planes (public SetClipPlane) */
-} ffp_uniforms_payload_t;
+/* ffp_light_payload_t / ffp_mat_payload_t / ffp_uniforms_payload_t are shared
+ * with the Metal backend via d3d9_metal.h so both sides use the same sizeof.
+ * The unified payload carries lighting (mat/lights/globalAmbient) and texture
+ * stage transforms (view/proj/textureFactor/texTransform). */
 
 static uint32_t fvf_stride(uint32_t fvf) {
     uint32_t s = 0;
     if (fvf & D3D9_FVF_XYZ) s += 12;
     else if (fvf & D3D9_FVF_XYZRHW) s += 16;
+    if (fvf & D3D9_FVF_NORMAL) s += 12;
     if (fvf & D3D9_FVF_DIFFUSE) s += 4;
+    if (fvf & D3D9_FVF_SPECULAR) s += 4;
     uint32_t tc = (fvf & D3D9_FVF_TEXCOUNT_MASK) >> D3D9_FVF_TEXCOUNT_SHIFT;
     s += tc * 8;
     return s ? s : 32;
@@ -1677,12 +1833,20 @@ static void *ensure_ffp_pipeline(d3d9_device_ctx_t *ctx, uint32_t *out_stride) {
         elems[nelems++] = (D3DVERTEXELEMENT9){ 0, off, D3DDECLTYPE_FLOAT4, 0, D3DDECLUSAGE_POSITIONT, 0 };
         off += 16;
     }
+    if (fvf & D3D9_FVF_NORMAL) {
+        elems[nelems++] = (D3DVERTEXELEMENT9){ 0, off, D3DDECLTYPE_FLOAT3, 0, D3DDECLUSAGE_NORMAL, 0 };
+        off += 12;
+    }
     if (fvf & D3D9_FVF_DIFFUSE) {
         elems[nelems++] = (D3DVERTEXELEMENT9){ 0, off, D3DDECLTYPE_D3DCOLOR, 0, D3DDECLUSAGE_COLOR, 0 };
         off += 4;
     }
+    if (fvf & D3D9_FVF_SPECULAR) {
+        elems[nelems++] = (D3DVERTEXELEMENT9){ 0, off, D3DDECLTYPE_D3DCOLOR, 0, D3DDECLUSAGE_COLOR, 1 };
+        off += 4;
+    }
     uint32_t tc = (fvf & D3D9_FVF_TEXCOUNT_MASK) >> D3D9_FVF_TEXCOUNT_SHIFT;
-    for (uint32_t i = 0; i < tc && i < 2; i++) {
+    for (uint32_t i = 0; i < tc && i < 8; i++) {
         elems[nelems++] = (D3DVERTEXELEMENT9){ 0, off, D3DDECLTYPE_FLOAT2, 0, D3DDECLUSAGE_TEXCOORD, (uint8_t)i };
         off += 8;
     }
@@ -1696,9 +1860,22 @@ static void *ensure_ffp_pipeline(d3d9_device_ctx_t *ctx, uint32_t *out_stride) {
     memset(&desc, 0, sizeof(desc));
     desc.fvf = fvf;
 
-    d3d9_ffp_stage_t stages[2];
+    d3d9_ffp_stage_t stages[8];
     memset(stages, 0, sizeof(stages));
-    desc.stage_count = tc > 0 ? (tc > 2 ? 2 : tc) : (ctx->textures[0] ? 1 : 0);
+    desc.stage_count = tc > 0 ? (tc > 8 ? 8 : tc) : (ctx->textures[0] ? 1 : 0);
+    /* D3DTSS constant indices */
+    #define TSS_COLORARG0 26u
+    #define TSS_ALPHAARG0 27u
+    #define TSS_RESULTARG 28u
+    #define TSS_CONSTANT 32u
+    #define TSS_TEXCOORDINDEX 11u
+    #define TSS_TEXTURETRANSFORMFLAGS 24u
+    #define TSS_BUMPENVMAT00 7u
+    #define TSS_BUMPENVMAT01 8u
+    #define TSS_BUMPENVMAT10 9u
+    #define TSS_BUMPENVMAT11 10u
+    #define TSS_BUMPENVLSCALE 22u
+    #define TSS_BUMPENVLOFFSET 23u
     for (uint32_t i = 0; i < desc.stage_count; i++) {
         uint32_t cop = ctx->texture_stage_states[i][D3DTSS_COLOROP];
         uint32_t ca1 = ctx->texture_stage_states[i][D3DTSS_COLORARG1];
@@ -1706,14 +1883,61 @@ static void *ensure_ffp_pipeline(d3d9_device_ctx_t *ctx, uint32_t *out_stride) {
         uint32_t aop = ctx->texture_stage_states[i][D3DTSS_ALPHAOP];
         uint32_t aa1 = ctx->texture_stage_states[i][D3DTSS_ALPHAARG1];
         uint32_t aa2 = ctx->texture_stage_states[i][D3DTSS_ALPHAARG2];
+        uint32_t ca0 = ctx->texture_stage_states[i][TSS_COLORARG0];
+        uint32_t aa0 = ctx->texture_stage_states[i][TSS_ALPHAARG0];
+        uint32_t res = ctx->texture_stage_states[i][TSS_RESULTARG];
+        uint32_t tci = ctx->texture_stage_states[i][TSS_TEXCOORDINDEX];
+        uint32_t ttf = ctx->texture_stage_states[i][TSS_TEXTURETRANSFORMFLAGS];
+        uint32_t cst = ctx->texture_stage_states[i][TSS_CONSTANT];
         stages[i].color_op = cop ? cop : (ctx->textures[i] ? D3D9_TEXOP_MODULATE : D3D9_TEXOP_DISABLE);
-        stages[i].color_arg1 = ca1 & 0xFu;
-        stages[i].color_arg2 = ca2 & 0xFu;
+        stages[i].color_arg0 = ca0 & 0x3Fu;
+        stages[i].color_arg1 = ca1 & 0x3Fu;
+        stages[i].color_arg2 = ca2 & 0x3Fu;
         stages[i].alpha_op = aop ? aop : (ctx->textures[i] ? D3D9_TEXOP_SELECTARG1 : D3D9_TEXOP_DISABLE);
-        stages[i].alpha_arg1 = aa1 & 0xFu;
-        stages[i].alpha_arg2 = aa2 & 0xFu;
+        stages[i].alpha_arg0 = aa0 & 0x3Fu;
+        stages[i].alpha_arg1 = aa1 & 0x3Fu;
+        stages[i].alpha_arg2 = aa2 & 0x3Fu;
+        stages[i].result_arg = res ? res : D3D9_TA_CURRENT;
+        stages[i].texcoord_index = tci;
+        stages[i].texture_transform_flags = ttf;
+        stages[i].constant = cst;
+        /* bump params */
+        uint32_t b00 = ctx->texture_stage_states[i][TSS_BUMPENVMAT00];
+        uint32_t b01 = ctx->texture_stage_states[i][TSS_BUMPENVMAT01];
+        uint32_t b10 = ctx->texture_stage_states[i][TSS_BUMPENVMAT10];
+        uint32_t b11 = ctx->texture_stage_states[i][TSS_BUMPENVMAT11];
+        memcpy(&stages[i].bumpenv_mat00, &b00, 4);
+        memcpy(&stages[i].bumpenv_mat01, &b01, 4);
+        memcpy(&stages[i].bumpenv_mat10, &b10, 4);
+        memcpy(&stages[i].bumpenv_mat11, &b11, 4);
+        uint32_t bls = ctx->texture_stage_states[i][TSS_BUMPENVLSCALE];
+        uint32_t blo = ctx->texture_stage_states[i][TSS_BUMPENVLOFFSET];
+        memcpy(&stages[i].bumpenv_lscale, &bls, 4);
+        memcpy(&stages[i].bumpenv_loffset, &blo, 4);
     }
     desc.stages = stages;
+    desc.texture_factor = ctx->render_states[60];
+    /* world/view/proj */
+    {
+        float *w = (float *)&ctx->transforms[D3DTS_WORLD];
+        float *v = (float *)&ctx->transforms[D3DTS_VIEW];
+        float *p = (float *)&ctx->transforms[D3DTS_PROJECTION];
+        /* identity fallback */
+        int zw=1,zv=1,zp=1;
+        for (int k=0;k<16;k++){ if(w[k]!=0)zw=0; if(v[k]!=0)zv=0; if(p[k]!=0)zp=0;}
+        if (zw) { memset(desc.world_matrix,0,sizeof(desc.world_matrix)); desc.world_matrix[0]=desc.world_matrix[5]=desc.world_matrix[10]=desc.world_matrix[15]=1.0f; }
+        else memcpy(desc.world_matrix, w, sizeof(desc.world_matrix));
+        if (zv) { memset(desc.view_matrix,0,sizeof(desc.view_matrix)); desc.view_matrix[0]=desc.view_matrix[5]=desc.view_matrix[10]=desc.view_matrix[15]=1.0f; }
+        else memcpy(desc.view_matrix, v, sizeof(desc.view_matrix));
+        if (zp) { memset(desc.proj_matrix,0,sizeof(desc.proj_matrix)); desc.proj_matrix[0]=desc.proj_matrix[5]=desc.proj_matrix[10]=desc.proj_matrix[15]=1.0f; }
+        else memcpy(desc.proj_matrix, p, sizeof(desc.proj_matrix));
+    }
+    for (uint32_t ti = 0; ti < 8; ti++) {
+        float *t = (float *)&ctx->transforms[16 + ti];
+        int z=1; for (int k=0;k<16;k++) if (t[k]!=0) z=0;
+        if (z) { memset(desc.texture_transforms[ti],0,sizeof(desc.texture_transforms[ti])); desc.texture_transforms[ti][0]=desc.texture_transforms[ti][5]=desc.texture_transforms[ti][10]=desc.texture_transforms[ti][15]=1.0f; }
+        else memcpy(desc.texture_transforms[ti], t, sizeof(desc.texture_transforms[ti]));
+    }
 
     /* Fog */
     if (ctx->render_states[D3DRS_FOGENABLE]) {
@@ -1740,12 +1964,59 @@ static void *ensure_ffp_pipeline(d3d9_device_ctx_t *ctx, uint32_t *out_stride) {
         desc.alpha_ref = ctx->render_states[D3DRS_ALPHAREF] & 0xFFu;
     }
 
-    /* Lighting */
+    /* Lighting — public D3D9 docs: XYZRHW (POSITIONT) vertices are
+     * pre-transformed and lit vertices are not supported; FFP lighting
+     * is forced off for XYZRHW regardless of D3DRS_LIGHTING. */
     desc.lighting = ctx->render_states[D3DRS_LIGHTING] ? 1u : 0u;
+    if (fvf & D3D9_FVF_XYZRHW) desc.lighting = 0;
+    desc.specular_enable = ctx->render_states[D3DRS_SPECULARENABLE] ? 1u : 0u;
+    desc.local_viewer = ctx->render_states[D3DRS_LOCALVIEWER] ? 1u : 0u;
+    desc.normalize_normals = ctx->render_states[D3DRS_NORMALIZENORMALS] ? 1u : 0u;
+    desc.color_vertex = ctx->render_states[D3DRS_COLORVERTEX] ? 1u : 0u;
+    desc.diff_mat_source = ctx->render_states[D3DRS_DIFFUSEMATERIALSOURCE];
+    desc.spec_mat_source = ctx->render_states[D3DRS_SPECULARMATERIALSOURCE];
+    desc.amb_mat_source = ctx->render_states[D3DRS_AMBIENTMATERIALSOURCE];
+    desc.emiss_mat_source = ctx->render_states[D3DRS_EMISSIVEMATERIALSOURCE];
 
     /* Uniforms */
     ffp_uniforms_payload_t u;
     memset(&u, 0, sizeof(u));
+    /* Global Ambient */
+    uint32_t amb_c = ctx->render_states[D3DRS_AMBIENT];
+    u.globalAmbient[0] = ((amb_c >> 16) & 0xFFu) / 255.0f;
+    u.globalAmbient[1] = ((amb_c >> 8) & 0xFFu) / 255.0f;
+    u.globalAmbient[2] = (amb_c & 0xFFu) / 255.0f;
+    u.globalAmbient[3] = ((amb_c >> 24) & 0xFFu) / 255.0f;
+
+    /* Material */
+    const D3DMATERIAL9 *pMat = (const D3DMATERIAL9 *)ctx->material;
+    memcpy(u.mat.diffuse, &pMat->Diffuse, 16);
+    memcpy(u.mat.ambient, &pMat->Ambient, 16);
+    memcpy(u.mat.specular, &pMat->Specular, 16);
+    memcpy(u.mat.emissive, &pMat->Emissive, 16);
+    u.mat.power_pad[0] = pMat->Power;
+
+    /* Lights */
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!ctx->light_enable[i] || !ctx->light_defined[i]) {
+            u.lights[i].params2[3] = 0.0f; /* inactive */
+            continue;
+        }
+        const D3DLIGHT9 *lt = (const D3DLIGHT9 *)ctx->lights[i];
+        memcpy(u.lights[i].diffuse, &lt->Diffuse, 16);
+        memcpy(u.lights[i].specular, &lt->Specular, 16);
+        memcpy(u.lights[i].ambient, &lt->Ambient, 16);
+        memcpy(u.lights[i].pos, &lt->Position, 12); u.lights[i].pos[3] = 1.0f;
+        memcpy(u.lights[i].dir, &lt->Direction, 12); u.lights[i].dir[3] = 0.0f;
+        u.lights[i].params1[0] = lt->Range;
+        u.lights[i].params1[1] = lt->Falloff;
+        u.lights[i].params1[2] = lt->Theta;
+        u.lights[i].params1[3] = lt->Phi;
+        u.lights[i].params2[0] = lt->Attenuation0;
+        u.lights[i].params2[1] = lt->Attenuation1;
+        u.lights[i].params2[2] = lt->Attenuation2;
+        u.lights[i].params2[3] = (float)lt->Type;
+    }
     /* Identity matrix by default */
     u.mvp[0] = u.mvp[5] = u.mvp[10] = u.mvp[15] = 1.0f;
     if (fvf & D3D9_FVF_XYZ) {
@@ -1769,12 +2040,26 @@ static void *ensure_ffp_pipeline(d3d9_device_ctx_t *ctx, uint32_t *out_stride) {
         if (zero_v) v[0] = v[5] = v[10] = v[15] = 1.0f;
         if (zero_p) p[0] = p[5] = p[10] = p[15] = 1.0f;
         memcpy(u.world, w, sizeof(u.world));
+        memcpy(u.view, v, sizeof(u.view));
+        memcpy(u.proj, p, sizeof(u.proj));
 
         float wv[16];
         mul_mat(w, v, wv);
         mul_mat(wv, p, u.mvp);
     } else {
         u.world[0] = u.world[5] = u.world[10] = u.world[15] = 1.0f;
+        u.view[0] = u.view[5] = u.view[10] = u.view[15] = 1.0f;
+        u.proj[0] = u.proj[5] = u.proj[10] = u.proj[15] = 1.0f;
+    }
+    {
+        uint32_t tf = desc.texture_factor;
+        u.textureFactor[0] = ((tf >> 16) & 0xFFu) / 255.0f;
+        u.textureFactor[1] = ((tf >> 8) & 0xFFu) / 255.0f;
+        u.textureFactor[2] = (tf & 0xFFu) / 255.0f;
+        u.textureFactor[3] = ((tf >> 24) & 0xFFu) / 255.0f;
+        for (uint32_t ti = 0; ti < 8; ti++) {
+            memcpy(u.texTransform[ti], desc.texture_transforms[ti], sizeof(u.texTransform[ti]));
+        }
     }
     uint32_t fc = desc.fog_color;
     u.fogColor[0] = ((fc >> 16) & 0xFFu) / 255.0f;
@@ -1784,6 +2069,15 @@ static void *ensure_ffp_pipeline(d3d9_device_ctx_t *ctx, uint32_t *out_stride) {
     u.fogStart = desc.fog_start;
     u.fogEnd = desc.fog_end;
     u.fogDensity = desc.fog_density;
+    /* Viewport for XYZRHW screen-pixel→clip conversion in the shader. */
+    u.viewportXYWH[0] = (float)ctx->viewport.X;
+    u.viewportXYWH[1] = (float)ctx->viewport.Y;
+    u.viewportXYWH[2] = (float)ctx->viewport.Width;
+    u.viewportXYWH[3] = (float)ctx->viewport.Height;
+    u.viewportZ[0] = ctx->viewport.MinZ;
+    u.viewportZ[1] = ctx->viewport.MaxZ;
+    u.viewportZ[2] = 0.0f;
+    u.viewportZ[3] = 0.0f;
 
     if (hle_d3d9_gpu && hle_d3d9_gpu->set_ffp_uniforms) {
         hle_d3d9_gpu->set_ffp_uniforms(&u, sizeof(u));
@@ -1829,6 +2123,8 @@ void dev9_DrawPrimitive(void) {
 
     apply_render_state(ctx);
     apply_shader_resources(ctx);
+
+    if (dev9_draw_blocked(ctx)) RET(D3DERR_NOTAVAILABLE, 4);
 
     /* Public docs: non-indexed instancing is not hardware accelerated and is
      * not supported by this backend. Never report a false OK for it. */
@@ -1924,6 +2220,7 @@ void dev9_DrawIndexedPrimitive(void) {
     d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)OBJ_CTX(self);
     apply_render_state(ctx);
     apply_shader_resources(ctx);
+    if (dev9_draw_blocked(ctx)) RET(D3DERR_NOTAVAILABLE, 7);
 
     void *vb = NULL, *ib = NULL;
     uint32_t stride = 32;
@@ -2062,6 +2359,85 @@ void dev9_DrawIndexedPrimitive(void) {
 
 void dev9_DrawPrimitiveUP(void) {
     /* (this, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride) */
+    uint32_t self = A32(0);
+    uint32_t type = A32(1);
+    uint32_t prim_count = A32(2);
+    uint32_t data_ptr = A32(3);
+    uint32_t stride = A32(4);
+    d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)OBJ_CTX(self);
+
+    apply_render_state(ctx);
+    apply_shader_resources(ctx);
+    if (dev9_draw_blocked(ctx)) RET(D3DERR_NOTAVAILABLE, 5);
+    if (!prim_count || !stride || !data_ptr) RET(D3D_OK, 5);
+
+    uint32_t vert_count = d3d9_prim_vertex_count(type, prim_count);
+    if (!vert_count) RET(D3DERR_INVALIDCALL, 5);
+
+    uint32_t data_size = vert_count * stride;
+    const uint8_t *verts = (const uint8_t *)hle_ptr(data_ptr);
+
+    /* Create a temp GPU vertex buffer and upload the user-pointer data. */
+    if (!hle_d3d9_gpu || !hle_d3d9_gpu->create_buffer || !hle_d3d9_gpu->upload_buffer) {
+        fprintf(stderr, "[d3d9] DrawPrimitiveUP: GPU buffer API unavailable\n");
+        RET(D3DERR_NOTAVAILABLE, 5);
+    }
+    void *gpu_vb = hle_d3d9_gpu->create_buffer(data_size, 0);
+    if (!gpu_vb) {
+        fprintf(stderr, "[d3d9] DrawPrimitiveUP: create_buffer failed\n");
+        RET(D3DERR_OUTOFVIDEOMEMORY, 5);
+    }
+    hle_d3d9_gpu->upload_buffer(gpu_vb, 0, verts, data_size);
+
+    /* Set up the pipeline (FFP or custom shader), same as DrawPrimitive. */
+    void *pipe = NULL;
+    uint32_t draw_stride = stride;
+    if (ctx->vertex_shader && ctx->pixel_shader) {
+        d3d9_shader_ctx_t *vs = (d3d9_shader_ctx_t *)OBJ_CTX(ctx->vertex_shader);
+        d3d9_shader_ctx_t *ps = (d3d9_shader_ctx_t *)OBJ_CTX(ctx->pixel_shader);
+        if (vs && ps && vs->msl && ps->msl && hle_d3d9_gpu->create_pipeline) {
+            pipe = hle_d3d9_gpu->create_pipeline(vs->msl, ps->msl);
+        }
+        if (!pipe) {
+            fprintf(stderr, "[d3d9] DrawPrimitiveUP: shader pipeline unavailable\n");
+            hle_d3d9_gpu->destroy_buffer(gpu_vb);
+            RET(D3DERR_INVALIDCALL, 5);
+        }
+    } else if (ctx->fvf) {
+        uint32_t ffp_stride = 0;
+        pipe = ensure_ffp_pipeline(ctx, &ffp_stride);
+        if (ffp_stride && !draw_stride) draw_stride = ffp_stride;
+        if (!pipe) {
+            fprintf(stderr, "[d3d9] DrawPrimitiveUP: FFP pipeline unavailable (fvf=0x%x)\n", ctx->fvf);
+            hle_d3d9_gpu->destroy_buffer(gpu_vb);
+            RET(D3DERR_INVALIDCALL, 5);
+        }
+    }
+
+    /* Draw. */
+    if (type == D3DPT_TRIANGLEFAN) {
+        uint32_t tris = d3d9_prim_triangle_count(type, prim_count);
+        uint32_t out_indices = 0;
+        uint32_t idx_buf[3072];
+        uint32_t *p_idx = idx_buf;
+        if (tris * 3 > 3072) p_idx = (uint32_t *)malloc(tris * 3 * sizeof(uint32_t));
+        if (p_idx && d3d9_prim_expand_nonindexed(type, 0, vert_count, p_idx, tris * 3, &out_indices) == 0 && out_indices > 0) {
+            void *dyn_ib = ensure_dynamic_ib(ctx, out_indices * 4);
+            if (dyn_ib && hle_d3d9_gpu->upload_buffer) {
+                hle_d3d9_gpu->upload_buffer(dyn_ib, 0, p_idx, out_indices * 4);
+                if (hle_d3d9_gpu->draw_indexed32) {
+                    hle_d3d9_gpu->draw_indexed32(D3DPT_TRIANGLELIST, 0, 0, out_indices, pipe, gpu_vb, dyn_ib, draw_stride);
+                }
+            }
+        }
+        if (p_idx && p_idx != idx_buf) free(p_idx);
+    } else {
+        if (hle_d3d9_gpu->draw) {
+            hle_d3d9_gpu->draw((int)type, 0, vert_count, pipe, gpu_vb, draw_stride);
+        }
+    }
+
+    hle_d3d9_gpu->destroy_buffer(gpu_vb);
     RET(D3D_OK, 5);
 }
 
@@ -2070,9 +2446,158 @@ void dev9_DrawIndexedPrimitiveUP(void) {
     RET(D3D_OK, 9);
 }
 
+/* ProcessVertices: fixed-function vertex processing of stream 0 into a vertex
+ * buffer (public IDirect3DDevice9::ProcessVertices). Position is transformed
+ * by World * View * Projection; a POSITIONT/XYZRHW destination gets the
+ * viewport-mapped (x, y, z, 1/w), a POSITION destination the clip-space
+ * position. Every other destination element is copied from the source element
+ * with the same usage, usage index and type, else zeroed. A bound vertex
+ * shader is not emulated here: that is reported, never faked. */
+#define PV_FVF_XYZ      0x002u
+#define PV_FVF_XYZRHW   0x004u
+#define PV_FVF_POSMASK  0x00Eu
+#define PV_FVF_NORMAL   0x010u
+#define PV_FVF_DIFFUSE  0x040u
+#define PV_FVF_SPECULAR 0x080u
+#define PV_FVF_TEXMASK  0xF00u
+
+static uint32_t pv_type_size(uint32_t t) {
+    static const uint8_t sz[8] = { 4, 8, 12, 16, 4, 4, 4, 8 };
+    return t < 8 ? sz[t] : 0;
+}
+
+/* Builds the element list for an FVF (plain XYZ/XYZRHW layouts only).
+ * Returns the stride, or 0 when the FVF is not supported. */
+static uint32_t pv_fvf_layout(uint32_t fvf, D3DVERTEXELEMENT9 *e, uint32_t *n) {
+    uint32_t pos = fvf & PV_FVF_POSMASK, off = 0, k = 0;
+    if (fvf & ~(PV_FVF_POSMASK | PV_FVF_NORMAL | PV_FVF_DIFFUSE | PV_FVF_SPECULAR | PV_FVF_TEXMASK)) return 0;
+    if (pos == PV_FVF_XYZ) {
+        e[k++] = (D3DVERTEXELEMENT9){ 0, (uint16_t)off, D3DDECLTYPE_FLOAT3, 0, D3DDECLUSAGE_POSITION, 0 }; off += 12;
+    } else if (pos == PV_FVF_XYZRHW) {
+        e[k++] = (D3DVERTEXELEMENT9){ 0, (uint16_t)off, D3DDECLTYPE_FLOAT4, 0, D3DDECLUSAGE_POSITIONT, 0 }; off += 16;
+    } else return 0;
+    if (fvf & PV_FVF_NORMAL) { e[k++] = (D3DVERTEXELEMENT9){ 0, (uint16_t)off, D3DDECLTYPE_FLOAT3, 0, 3, 0 }; off += 12; }
+    if (fvf & PV_FVF_DIFFUSE) { e[k++] = (D3DVERTEXELEMENT9){ 0, (uint16_t)off, 4, 0, 10, 0 }; off += 4; }
+    if (fvf & PV_FVF_SPECULAR) { e[k++] = (D3DVERTEXELEMENT9){ 0, (uint16_t)off, 4, 0, 10, 1 }; off += 4; }
+    for (uint32_t t = 0; t < ((fvf & PV_FVF_TEXMASK) >> 8); t++) {
+        e[k++] = (D3DVERTEXELEMENT9){ 0, (uint16_t)off, D3DDECLTYPE_FLOAT2, 0, 5, (uint8_t)t }; off += 8;
+    }
+    *n = k;
+    return off;
+}
+
+static uint32_t pv_decl_layout(const d3d9_decl_ctx_t *d, D3DVERTEXELEMENT9 *e, uint32_t *n) {
+    uint32_t k = 0, stride = 0;
+    for (uint32_t i = 0; i < d->num_elements && k < 32; i++) {
+        if (d->elements[i].Stream != 0) continue;
+        uint32_t sz = pv_type_size(d->elements[i].Type);
+        e[k++] = d->elements[i];
+        if (d->elements[i].Offset + sz > stride) stride = d->elements[i].Offset + sz;
+    }
+    *n = k;
+    return stride;
+}
+
 void dev9_ProcessVertices(void) {
-    fprintf(stderr, "[d3d9] IDirect3DDevice9::ProcessVertices: not implemented\n");
-    RET(D3DERR_NOTAVAILABLE, 7);
+    /* (this, SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags) */
+    uint32_t self = A32(0), src_start = A32(1), dst_index = A32(2), count = A32(3);
+    uint32_t pDest = A32(4), pDecl = A32(5);
+    d3d9_device_ctx_t *ctx = (d3d9_device_ctx_t *)OBJ_CTX(self);
+    D3DVERTEXELEMENT9 se[32], de[32];
+    uint32_t sn = 0, dn = 0, sstride, dstride;
+
+    if (ctx->vertex_shader) {
+        fprintf(stderr, "[d3d9] ProcessVertices: a bound vertex shader is not emulated\n");
+        RET(D3DERR_NOTAVAILABLE, 7);
+    }
+    if (!ctx->streams[0].vb || !pDest) RET(D3DERR_INVALIDCALL, 7);
+    d3d9_vb_ctx_t *svb = (d3d9_vb_ctx_t *)OBJ_CTX(ctx->streams[0].vb);
+    d3d9_vb_ctx_t *dvb = (d3d9_vb_ctx_t *)OBJ_CTX(pDest);
+    if (!svb || !dvb || !svb->data || !dvb->data) RET(D3DERR_INVALIDCALL, 7);
+
+    if (ctx->vertex_decl) {
+        d3d9_decl_ctx_t *dc = (d3d9_decl_ctx_t *)OBJ_CTX(ctx->vertex_decl);
+        sstride = dc ? pv_decl_layout(dc, se, &sn) : 0;
+    } else {
+        sstride = pv_fvf_layout(ctx->fvf, se, &sn);
+    }
+    if (pDecl) {
+        d3d9_decl_ctx_t *dc = (d3d9_decl_ctx_t *)OBJ_CTX(pDecl);
+        dstride = dc ? pv_decl_layout(dc, de, &dn) : 0;
+    } else {
+        dstride = pv_fvf_layout(dvb->desc.FVF, de, &dn);
+    }
+    if (!sstride || !dstride) RET(D3DERR_INVALIDCALL, 7);
+    if (ctx->streams[0].stride && ctx->streams[0].stride < sstride) RET(D3DERR_INVALIDCALL, 7);
+    uint32_t step = ctx->streams[0].stride ? ctx->streams[0].stride : sstride;
+    if (count == 0) RET(D3D_OK, 7);
+    if ((uint64_t)ctx->streams[0].offset + (uint64_t)(src_start + count) * step > svb->desc.Size ||
+        (uint64_t)(dst_index + count) * dstride > dvb->desc.Size) RET(D3DERR_INVALIDCALL, 7);
+
+    const D3DVERTEXELEMENT9 *sp = NULL;
+    for (uint32_t i = 0; i < sn; i++)
+        if ((se[i].Usage == D3DDECLUSAGE_POSITION || se[i].Usage == D3DDECLUSAGE_POSITIONT) && se[i].UsageIndex == 0) { sp = &se[i]; break; }
+    if (!sp || (sp->Type != D3DDECLTYPE_FLOAT3 && sp->Type != D3DDECLTYPE_FLOAT4)) RET(D3DERR_INVALIDCALL, 7);
+
+    /* M = World * View * Projection (row vectors, as in D3D). */
+    const D3DMATRIX *W = &ctx->transforms[256], *V = &ctx->transforms[2], *P = &ctx->transforms[3];
+    float WV[4][4], M[4][4];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
+        float a = 0; for (int k = 0; k < 4; k++) a += W->m[i][k] * V->m[k][j];
+        WV[i][j] = a;
+    }
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
+        float a = 0; for (int k = 0; k < 4; k++) a += WV[i][k] * P->m[k][j];
+        M[i][j] = a;
+    }
+
+    for (uint32_t v = 0; v < count; v++) {
+        const uint8_t *src = svb->data + ctx->streams[0].offset + (uint64_t)(src_start + v) * step;
+        uint8_t *dst = dvb->data + (uint64_t)(dst_index + v) * dstride;
+        memset(dst, 0, dstride);
+        float in[4] = { 0, 0, 0, 1 }, out[4];
+        memcpy(in, src + sp->Offset, sp->Type == D3DDECLTYPE_FLOAT4 ? 12 : 12);
+        if (sp->Type == D3DDECLTYPE_FLOAT4) memcpy(&in[3], src + sp->Offset + 12, 4);
+        int pre = sp->Usage == D3DDECLUSAGE_POSITIONT;   /* already transformed */
+        for (int j = 0; j < 4; j++)
+            out[j] = pre ? in[j] : in[0] * M[0][j] + in[1] * M[1][j] + in[2] * M[2][j] + in[3] * M[3][j];
+        for (uint32_t i = 0; i < dn; i++) {
+            uint8_t *d = dst + de[i].Offset;
+            uint32_t sz = pv_type_size(de[i].Type);
+            if (de[i].Usage == D3DDECLUSAGE_POSITIONT || (de[i].Usage == D3DDECLUSAGE_POSITION && de[i].UsageIndex == 0)) {
+                float r[4];
+                if (de[i].Usage == D3DDECLUSAGE_POSITIONT && !pre) {
+                    /* POSITION source → POSITIONT dest: clip → viewport. */
+                    float rhw = out[3] != 0.0f ? 1.0f / out[3] : 1.0f;
+                    r[0] = (float)ctx->viewport.X + (out[0] * rhw * 0.5f + 0.5f) * (float)ctx->viewport.Width;
+                    r[1] = (float)ctx->viewport.Y + (1.0f - (out[1] * rhw * 0.5f + 0.5f)) * (float)ctx->viewport.Height;
+                    r[2] = ctx->viewport.MinZ + out[2] * rhw * (ctx->viewport.MaxZ - ctx->viewport.MinZ);
+                    r[3] = rhw;
+                } else if (de[i].Usage == D3DDECLUSAGE_POSITION && pre) {
+                    /* POSITIONT source → POSITION dest: viewport → clip. */
+                    float w_clip = out[3] != 0.0f ? 1.0f / out[3] : 1.0f;
+                    float z_range = ctx->viewport.MaxZ - ctx->viewport.MinZ;
+                    float x_ndc = 2.0f * (out[0] - (float)ctx->viewport.X) / (float)ctx->viewport.Width - 1.0f;
+                    float y_ndc = 1.0f - 2.0f * (out[1] - (float)ctx->viewport.Y) / (float)ctx->viewport.Height;
+                    float z_ndc = z_range != 0.0f ? 2.0f * (out[2] - ctx->viewport.MinZ) / z_range - 1.0f : 2.0f * out[2] - 1.0f;
+                    r[0] = x_ndc * w_clip;
+                    r[1] = y_ndc * w_clip;
+                    r[2] = z_ndc * w_clip;
+                    r[3] = w_clip;
+                } else {
+                    memcpy(r, out, sizeof r);
+                }
+                memcpy(d, r, sz < 16 ? sz : 16);
+                continue;
+            }
+            for (uint32_t k = 0; k < sn; k++)
+                if (se[k].Usage == de[i].Usage && se[k].UsageIndex == de[i].UsageIndex && se[k].Type == de[i].Type) {
+                    memcpy(d, src + se[k].Offset, sz);
+                    break;
+                }
+        }
+    }
+    RET(D3D_OK, 7);
 }
 void dev9_CreateVertexDeclaration(void);
 

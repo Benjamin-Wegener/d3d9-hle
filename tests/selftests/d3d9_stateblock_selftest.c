@@ -543,7 +543,7 @@ int main(void) {
         set_sampler(dev, 1, 4); set_sampler(dev, 13, 8);              /* ADDRESSU: pixel, DMAPOFFSET: vertex */
         uint32_t pb = create_sb(dev, D3DSBT_PIXELSTATE);
         uint32_t vb_ = create_sb(dev, D3DSBT_VERTEXSTATE);
-        set_rs(dev, 14, 0); set_rs(dev, 15, 0); set_rs(dev, 23, 0); set_rs(dev, 22, 0); set_rs(dev, 28, 0);
+        set_rs(dev, 14, 0); set_rs(dev, 15, 0); set_rs(dev, 23, 8); set_rs(dev, 22, 0); set_rs(dev, 28, 0);
         set_tss(dev, 1, 0); set_tss(dev, 11, 0); set_sampler(dev, 1, 0); set_sampler(dev, 13, 0);
         apply_sb(pb);
         ok("PIXEL block restores ZWRITEENABLE/ALPHATESTENABLE/ZFUNC",
@@ -552,11 +552,11 @@ int main(void) {
         ok("PIXEL block: COLOROP and sampler ADDRESSU restored, TEXCOORDINDEX and DMAPOFFSET not",
            D->texture_stage_states[0][1] == 5 && D->texture_stage_states[0][11] == 0 &&
            D->sampler_states[0][1] == 4 && D->sampler_states[0][13] == 0);
-        set_rs(dev, 14, 0); set_rs(dev, 15, 0); set_rs(dev, 23, 0);
+        set_rs(dev, 14, 0); set_rs(dev, 15, 0); set_rs(dev, 23, 8);
         apply_sb(vb_);
         ok("VERTEX block restores CULLMODE/FOGENABLE", D->render_states[22] == 2 && D->render_states[28] == 1);
         ok("VERTEX block leaves ZWRITEENABLE/ALPHATESTENABLE/ZFUNC alone",
-           D->render_states[14] == 0 && D->render_states[15] == 0 && D->render_states[23] == 0);
+           D->render_states[14] == 0 && D->render_states[15] == 0 && D->render_states[23] == 8);
         ok("VERTEX block: TEXCOORDINDEX and DMAPOFFSET restored",
            D->texture_stage_states[0][11] == 6 && D->sampler_states[0][13] == 8);
         release_sb(pb); release_sb(vb_);
@@ -658,9 +658,9 @@ int main(void) {
         /* Capture re-reads only the recorded states. */
         set_rs(dev, 27, 6); set_rs(dev, 19, 7);
         ok("Capture(recorded) hr == 0", capture_sb(rec) == D3D_OK);
-        set_rs(dev, 27, 0); set_rs(dev, 19, 0);
+        set_rs(dev, 27, 0); set_rs(dev, 19, 1);
         apply_sb(rec);
-        ok("Capture updated the recorded state, not the others", D->render_states[27] == 6 && D->render_states[19] == 0);
+        ok("Capture updated the recorded state, not the others", D->render_states[27] == 6 && D->render_states[19] == 1);
         release_sb(rec);
         ok("releasing the recorded block drops its texture reference", REF(tex) == tex_ref0);
         set_tex(dev, 0, 1);

@@ -10,6 +10,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <SDL.h>
+#include <SDL_metal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +23,11 @@ static int g_metal_active = 0;
 static id<MTLDevice> g_dev = nil;
 static id<MTLCommandQueue> g_cmd_queue = nil;
 static id<MTLCommandBuffer> g_curr_cmd_buf = nil;
+/* Present commits the draw buffer without waiting and clears g_curr_cmd_buf.
+ * A following getBytes used to see a buffer that had only been cleared (or
+ * not written at all). Keep the last committed draw buffer so flush_gpu()
+ * can wait on it before any pixel read. */
+static id<MTLCommandBuffer> g_pending_draw_cb = nil;
 static id<MTLRenderCommandEncoder> g_curr_encoder = nil;
 static void flush_gpu(void);
 
@@ -104,8 +111,10 @@ static uint32_t g_decl_hash;
 static uint32_t g_rt_width = 0;
 static uint32_t g_rt_height = 0;
 
-/* FFP uniforms buffer */
-static uint8_t g_ffp_uniforms[256];
+/* FFP uniforms buffer. Sized from the shared payload struct (d3d9_metal.h) so
+ * all 8 lights and the texture-stage transforms fit; a fixed small buffer
+ * silently dropped the upper lights / texTransform tail. */
+static uint8_t g_ffp_uniforms[sizeof(ffp_uniforms_payload_t)];
 static uint32_t g_ffp_uniforms_size = 0;
 
 /* User clip planes.  Rendered by the generated MSL, not by any render-pass
@@ -131,6 +140,23 @@ static id<MTLTexture> g_present_tex = nil;
 static id<MTLRenderPipelineState> g_gamma_pipe = nil;
 static id<MTLCommandBuffer> g_present_cb = nil;
 static int g_gamma_active = 0;
+
+/* Windowed presentation into a CAMetalLayer. g_layer is non-owning: SDL owns
+ * the layer behind an SDL_MetalView, and a host-set layer is owned by the host.
+ * The drawable texture and the last display command buffer are retained so a
+ * pixel test can read exactly what was presented (framebufferOnly = NO). */
+static CAMetalLayer *g_layer = nil;
+static SDL_MetalView g_metal_view = NULL;
+static SDL_Window *g_window = NULL;
+static id<MTLTexture> g_drawable_tex = nil;
+static id<MTLCommandBuffer> g_display_cb = nil;
+static id<MTLRenderPipelineState> g_blit_pipe = nil;
+static int g_display_active = 0;
+static int32_t g_src_rect[4] = { 0, 0, 0, 0 };
+static int32_t g_dst_rect[4] = { 0, 0, 0, 0 };
+static uint32_t g_fullscreen = 0;
+static void release_display(void);
+static void auto_bind_window(uint32_t width, uint32_t height);
 
 /* Default shaders */
 static const char *s_default_shader =
@@ -642,6 +668,10 @@ int hle_d3d9_metal_init_device(uint32_t width, uint32_t height) {
             if (g_vis_buf) memset([g_vis_buf contents], 0, VIS_BUF_SIZE);
         }
     }
+    /* CreateDevice/Reset: bind the target SDL window (if any) to a
+     * CAMetalLayer so Present becomes visible. No window / dummy driver /
+     * hidden window leaves the backend offscreen-only. */
+    if (g_rt_tex) auto_bind_window(width, height);
     return (g_rt_tex != nil) ? 0 : -1;
 }
 
@@ -649,6 +679,7 @@ void hle_d3d9_metal_shutdown_device(void) {
     @autoreleasepool {
         if (g_curr_encoder) { [g_curr_encoder endEncoding]; [g_curr_encoder release]; g_curr_encoder = nil; }
         if (g_curr_cmd_buf) { [g_curr_cmd_buf commit]; [g_curr_cmd_buf release]; g_curr_cmd_buf = nil; }
+        if (g_pending_draw_cb) { [g_pending_draw_cb waitUntilCompleted]; [g_pending_draw_cb release]; g_pending_draw_cb = nil; }
         /* g_rt_tex may be a borrowed surface texture; only the backend-owned
          * backbuffer and the objects created here are released. */
         if (g_owned_rt) { [g_owned_rt release]; g_owned_rt = nil; }
@@ -661,6 +692,8 @@ void hle_d3d9_metal_shutdown_device(void) {
         if (g_gamma_pipe) { [g_gamma_pipe release]; g_gamma_pipe = nil; }
         if (g_present_cb) { [g_present_cb release]; g_present_cb = nil; }
         g_gamma_active = 0;
+        release_display();
+        if (g_blit_pipe) { [g_blit_pipe release]; g_blit_pipe = nil; }
         g_vis_next_offset = 0;
         g_vis_free_n = 0;
         destroy_bundle(g_default_bundle); g_default_bundle = NULL;
@@ -849,6 +882,210 @@ int hle_d3d9_metal_read_present_pixels(uint32_t x, uint32_t y, uint32_t w, uint3
     return 0;
 }
 
+/* ---- Windowed presentation ---------------------------------------------
+ * Public D3D9 swap chain: at Present the backbuffer is copied into the next
+ * CAMetalLayer drawable. A single full-screen triangle samples the (gamma
+ * corrected) render target; the source/destination RECTs of Present map
+ * destination pixels back to source pixels, so scaling and cropping work for
+ * windowed and fullscreen mode alike. */
+static const char *s_blit_fs =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"struct BlitParams {\n"
+"  float4 src;    // source RECT in source pixels (left,top,right,bottom)\n"
+"  float4 dst;    // destination RECT in drawable pixels\n"
+"  float2 srcSize;\n"
+"  float2 pad;\n"
+"};\n"
+"fragment float4 blit_fs(float4 pos [[position]],\n"
+"  constant BlitParams& p [[buffer(0)]],\n"
+"  texture2d<float, access::read> src [[texture(0)]]) {\n"
+"  float sx = p.src.x + (pos.x - p.dst.x) * (p.src.z - p.src.x) / max(p.dst.z - p.dst.x, 1.0f);\n"
+"  float sy = p.src.y + (pos.y - p.dst.y) * (p.src.w - p.src.y) / max(p.dst.w - p.dst.y, 1.0f);\n"
+"  int2 q = clamp(int2(sx, sy), int2(0), int2(p.srcSize) - int2(1));\n"
+"  return src.read(uint2(q));\n}\n";
+
+typedef struct { float src[4], dst[4], srcSize[2], pad[2]; } blit_params_t;
+
+static id<MTLRenderPipelineState> blit_pipeline(void) {
+    if (g_blit_pipe) return g_blit_pipe;
+    NSError *err = nil;
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:s_gamma_vs]
+                                            options:nil error:&err];
+    id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"gamma_vs"] : nil;
+    [lib release];
+    lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:s_blit_fs]
+                             options:nil error:&err];
+    id<MTLFunction> fs = lib ? [lib newFunctionWithName:@"blit_fs"] : nil;
+    [lib release];
+    if (!vs || !fs) {
+        fprintf(stderr, "[d3d9_metal] blit pipeline compile failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "unknown");
+        [vs release]; [fs release];
+        return nil;
+    }
+    MTLRenderPipelineDescriptor *pdesc = [[MTLRenderPipelineDescriptor alloc] init];
+    pdesc.vertexFunction = vs;
+    pdesc.fragmentFunction = fs;
+    pdesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    g_blit_pipe = [g_dev newRenderPipelineStateWithDescriptor:pdesc error:&err];
+    [pdesc release];
+    [vs release]; [fs release];
+    return g_blit_pipe;
+}
+
+static void release_display(void) {
+    if (g_display_cb) { [g_display_cb waitUntilCompleted]; [g_display_cb release]; g_display_cb = nil; }
+    if (g_drawable_tex) { [g_drawable_tex release]; g_drawable_tex = nil; }
+    if (g_metal_view && g_window) { SDL_Metal_DestroyView(g_metal_view); g_metal_view = NULL; }
+    g_window = NULL;
+    g_layer = nil;          /* non-owning: SDL or the host owns it */
+    g_display_active = 0;
+}
+
+void hle_d3d9_metal_set_window(void *sdl_window) {
+    if (!g_metal_active) return;
+    @autoreleasepool {
+        release_display();
+        if (!sdl_window || !SDL_WasInit(SDL_INIT_VIDEO)) return;
+        const char *drv = SDL_GetCurrentVideoDriver();
+        if (drv && !strcmp(drv, "dummy")) {
+            fprintf(stderr, "[d3d9_metal] SDL dummy-Treiber: kein Fenster-Display\n");
+            return;
+        }
+        SDL_Window *w = (SDL_Window *)sdl_window;
+        if (!(SDL_GetWindowFlags(w) & SDL_WINDOW_SHOWN)) return;
+        SDL_MetalView view = SDL_Metal_CreateView(w);
+        if (!view) { fprintf(stderr, "[d3d9_metal] SDL_Metal_CreateView: %s\n", SDL_GetError()); return; }
+        CAMetalLayer *layer = (CAMetalLayer *)SDL_Metal_GetLayer(view);
+        if (!layer) {
+            fprintf(stderr, "[d3d9_metal] SDL_Metal_GetLayer: %s\n", SDL_GetError());
+            SDL_Metal_DestroyView(view);
+            return;
+        }
+        if (g_dev) layer.device = g_dev;   /* sonst liefert nextDrawable nil */
+        layer.framebufferOnly = NO;   /* drawable readback for tests */
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        g_metal_view = view;
+        g_window = w;
+        g_layer = layer;
+        g_display_active = 1;
+    }
+}
+
+void hle_d3d9_metal_set_layer(void *cametal_layer) {
+    if (!g_metal_active) return;
+    @autoreleasepool {
+        release_display();
+        if (!cametal_layer) return;
+        CAMetalLayer *l = (CAMetalLayer *)cametal_layer;
+        if (g_dev) l.device = g_dev;
+        l.framebufferOnly = NO;
+        l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        g_layer = l;
+        g_display_active = 1;
+    }
+}
+
+void *hle_d3d9_metal_create_layer(void) {
+    @autoreleasepool {
+        CAMetalLayer *l = [[CAMetalLayer alloc] init];
+        if (g_dev) l.device = g_dev;
+        l.framebufferOnly = NO;
+        l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        return (void *)l;   /* caller owns it */
+    }
+}
+
+void hle_d3d9_metal_release_layer(void *layer) {
+    if (layer) @autoreleasepool { [(CAMetalLayer *)layer release]; }
+}
+
+void hle_d3d9_metal_set_present_params(const int32_t src[4], const int32_t dst[4],
+                                       uint32_t fullscreen) {
+    if (src) memcpy(g_src_rect, src, sizeof g_src_rect);
+    else memset(g_src_rect, 0, sizeof g_src_rect);
+    if (dst) memcpy(g_dst_rect, dst, sizeof g_dst_rect);
+    else memset(g_dst_rect, 0, sizeof g_dst_rect);
+    g_fullscreen = fullscreen;
+}
+
+/* Find the SDL application window when no host set one. The games create
+ * their SDL_Window before CreateDevice/Reset; scanning SDL's window IDs finds
+ * it without any game change. Hidden windows and the dummy driver are skipped
+ * so headless test mode keeps the offscreen-only behaviour. */
+static void auto_bind_window(uint32_t width, uint32_t height) {
+    if (g_display_active || !SDL_WasInit(SDL_INIT_VIDEO)) return;
+    const char *drv = SDL_GetCurrentVideoDriver();
+    if (drv && !strcmp(drv, "dummy")) return;
+    SDL_Window *best = NULL;
+    for (Uint32 id = 1; id <= 4096; ++id) {
+        SDL_Window *win = SDL_GetWindowFromID(id);
+        if (!win || !(SDL_GetWindowFlags(win) & SDL_WINDOW_SHOWN)) continue;
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(win, &ww, &wh);
+        if (ww == (int)width && wh == (int)height) { best = win; break; }
+        if (!best) best = win;
+    }
+    if (best) hle_d3d9_metal_set_window(best);
+}
+
+static void display_drawable(void) {
+    if (!g_display_active || !g_layer || !g_cmd_queue) return;
+    id<MTLTexture> source = (g_gamma_active && g_present_tex) ? g_present_tex : msaa_resolved_texture();
+    if (!source || !source.width || !source.height) return;
+    @autoreleasepool {
+        CGSize dsize = CGSizeMake((CGFloat)source.width, (CGFloat)source.height);
+        if (!CGSizeEqualToSize(g_layer.drawableSize, dsize)) [g_layer setDrawableSize:dsize];
+        id<CAMetalDrawable> drawable = [g_layer nextDrawable];
+        if (!drawable || !drawable.texture) {
+            fprintf(stderr, "[d3d9_metal] Present: kein CAMetalDrawable\n");
+            return;
+        }
+        id<MTLRenderPipelineState> pipe = blit_pipeline();
+        if (!pipe) return;
+        blit_params_t bp;
+        int32_t sr[4] = { 0, 0, (int32_t)source.width, (int32_t)source.height };
+        int32_t dr[4] = { 0, 0, (int32_t)drawable.texture.width, (int32_t)drawable.texture.height };
+        if (g_src_rect[2] > g_src_rect[0] && g_src_rect[3] > g_src_rect[1])
+            memcpy(sr, g_src_rect, sizeof sr);
+        if (g_dst_rect[2] > g_dst_rect[0] && g_dst_rect[3] > g_dst_rect[1])
+            memcpy(dr, g_dst_rect, sizeof dr);
+        for (int i = 0; i < 4; i++) { bp.src[i] = (float)sr[i]; bp.dst[i] = (float)dr[i]; }
+        bp.srcSize[0] = (float)source.width;
+        bp.srcSize[1] = (float)source.height;
+        bp.pad[0] = bp.pad[1] = 0.0f;
+        id<MTLCommandBuffer> cb = [g_cmd_queue commandBuffer];
+        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+        rpd.colorAttachments[0].texture = drawable.texture;
+        rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+        [enc setRenderPipelineState:pipe];
+        [enc setFragmentBytes:&bp length:sizeof bp atIndex:0];
+        [enc setFragmentTexture:source atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        [cb presentDrawable:drawable];
+        [cb commit];
+        if (g_display_cb) [g_display_cb release];
+        g_display_cb = [cb retain];
+        if (g_drawable_tex) [g_drawable_tex release];
+        g_drawable_tex = [drawable.texture retain];
+        (void)g_fullscreen;   // rects already describe windowed/fullscreen blit
+    }
+}
+
+int hle_d3d9_metal_read_drawable_pixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                        void *out, uint32_t out_bytes_per_row) {
+    if (!g_display_active || !g_drawable_tex || !out || !w || !h) return -1;
+    @autoreleasepool {
+        if (g_display_cb) [g_display_cb waitUntilCompleted];
+        [g_drawable_tex getBytes:out bytesPerRow:out_bytes_per_row
+                     fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
+    }
+    return 0;
+}
+
 int hle_d3d9_metal_present(void) {
     if (!g_metal_active) return 0;
     @autoreleasepool {
@@ -859,6 +1096,13 @@ int hle_d3d9_metal_present(void) {
         }
         if (g_curr_cmd_buf) {
             [g_curr_cmd_buf commit];
+            /* Both fixes for the Present/getBytes race: wait here (main's
+             * variant) and keep the buffer so a later pixel read also waits
+             * via flush_gpu (this task's variant). The second wait is cheap
+             * once the command buffer is complete. */
+            [g_curr_cmd_buf waitUntilCompleted];
+            if (g_pending_draw_cb) [g_pending_draw_cb release];
+            g_pending_draw_cb = [g_curr_cmd_buf retain];
             [g_curr_cmd_buf release];
             g_curr_cmd_buf = nil;
         }
@@ -894,6 +1138,10 @@ int hle_d3d9_metal_present(void) {
                 fprintf(stderr, "[d3d9_metal] Present: gamma pass unavailable\n");
             }
         }
+        /* Windowed presentation: copy the (gamma-corrected) backbuffer into
+         * the CAMetalLayer drawable. Headless/test mode has no layer and keeps
+         * the offscreen-only behaviour above. */
+        display_drawable();
     }
     return 0;
 }
@@ -1120,13 +1368,26 @@ static id<MTLRenderPipelineState> select_pipeline(void *pipe) {
     return bundle_pipeline(b);
 }
 
+/* D3D9: Lock/Unlock ohne NOOVERWRITE darf bereits aufgezeichnete Draws nicht
+ * veraendern. Die Draws laufen hier erst beim Commit (Present/flush) auf der
+ * GPU, der Upload schreibt aber sofort in den geteilten MTLBuffer. Darum wird
+ * beim Binden eine Kopie des aktuellen Inhalts verwendet; der Command Buffer
+ * haelt sie bis zum Ende fest (retainedReferences). */
+static id<MTLBuffer> snap_buffer(void *buf) {
+    if (!buf || !g_dev) return (id<MTLBuffer>)buf;
+    id<MTLBuffer> src = (id<MTLBuffer>)buf;
+    id<MTLBuffer> c = [g_dev newBufferWithBytes:src.contents length:src.length
+                                        options:MTLResourceStorageModeShared];
+    return c ? [c autorelease] : src;
+}
+
 static void prepare_encoder(id<MTLRenderPipelineState> pipe, void *vb, pipe_bundle_t *bundle) {
     [g_curr_encoder setRenderPipelineState:pipe];
     [g_curr_encoder setCullMode:cull_mode(g_cull_mode)];
     id<MTLDepthStencilState> ds = current_depth_state();
     if (ds) [g_curr_encoder setDepthStencilState:ds];
     apply_scissor();
-    if (vb) [g_curr_encoder setVertexBuffer:(id<MTLBuffer>)vb offset:0 atIndex:0];
+    if (vb) [g_curr_encoder setVertexBuffer:snap_buffer(vb) offset:0 atIndex:0];
     if (bundle && bundle->translated == 2 && g_ffp_uniforms_size > 0) {
         [g_curr_encoder setVertexBytes:g_ffp_uniforms length:g_ffp_uniforms_size atIndex:1];
         [g_curr_encoder setFragmentBytes:g_ffp_uniforms length:g_ffp_uniforms_size atIndex:1];
@@ -1176,7 +1437,7 @@ int hle_d3d9_metal_draw_indexed(int prim_type, uint32_t base_vertex, uint32_t st
         [g_curr_encoder drawIndexedPrimitives:primitive_type(prim_type)
                                    indexCount:index_count
                                     indexType:MTLIndexTypeUInt16
-                                  indexBuffer:(id<MTLBuffer>)ib
+                                  indexBuffer:snap_buffer(ib)
                             indexBufferOffset:(NSUInteger)start_index * 2u
                                 instanceCount:1
                                    baseVertex:(NSInteger)base_vertex
@@ -1198,7 +1459,7 @@ int hle_d3d9_metal_draw_indexed32(int prim_type, uint32_t base_vertex, uint32_t 
         [g_curr_encoder drawIndexedPrimitives:primitive_type(prim_type)
                                    indexCount:index_count
                                     indexType:MTLIndexTypeUInt32
-                                  indexBuffer:(id<MTLBuffer>)ib
+                                  indexBuffer:snap_buffer(ib)
                             indexBufferOffset:(NSUInteger)start_index * 4u
                                 instanceCount:1
                                    baseVertex:(NSInteger)base_vertex
@@ -1242,11 +1503,11 @@ int hle_d3d9_metal_draw_indexed_instanced(int prim_type, uint32_t base_vertex, u
         if (!mtl_pipe) return -1;
         prepare_encoder(mtl_pipe, vb, b);
         /* Per-instance attributes declared in streams > 0 use Metal buffer 5. */
-        if (inst_vb) [g_curr_encoder setVertexBuffer:(id<MTLBuffer>)inst_vb offset:0 atIndex:5];
+        if (inst_vb) [g_curr_encoder setVertexBuffer:snap_buffer(inst_vb) offset:0 atIndex:5];
         [g_curr_encoder drawIndexedPrimitives:primitive_type(prim_type)
                                    indexCount:index_count
                                     indexType:index32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
-                                  indexBuffer:(id<MTLBuffer>)ib
+                                  indexBuffer:snap_buffer(ib)
                             indexBufferOffset:(NSUInteger)start_index * (index32 ? 4u : 2u)
                                 instanceCount:instance_count
                                    baseVertex:(NSInteger)base_vertex
@@ -1549,7 +1810,14 @@ void hle_d3d9_metal_set_ffp_uniforms(const void *uniforms, uint32_t size) {
         g_ffp_uniforms_size = 0;
         return;
     }
-    if (size > sizeof(g_ffp_uniforms)) size = sizeof(g_ffp_uniforms);
+    if (size > sizeof(g_ffp_uniforms)) {
+        /* Never silently truncate: dropping the tail would lose the upper
+         * lights while still reporting success. Refuse and log instead. */
+        fprintf(stderr, "[d3d9_metal] FFP uniforms %u bytes exceed buffer %zu; not uploaded\n",
+                size, sizeof(g_ffp_uniforms));
+        g_ffp_uniforms_size = 0;
+        return;
+    }
     memcpy(g_ffp_uniforms, uniforms, size);
     g_ffp_uniforms_size = size;
 }
@@ -1593,6 +1861,13 @@ static void flush_gpu(void) {
         [g_curr_cmd_buf waitUntilCompleted];
         [g_curr_cmd_buf release];
         g_curr_cmd_buf = nil;
+    }
+    /* The buffer committed by Present is no longer in g_curr_cmd_buf. Wait on
+     * it explicitly: getBytes must not race the clear/draw it contains. */
+    if (g_pending_draw_cb) {
+        [g_pending_draw_cb waitUntilCompleted];
+        [g_pending_draw_cb release];
+        g_pending_draw_cb = nil;
     }
 }
 
@@ -1722,6 +1997,16 @@ int hle_d3d9_metal_read_pixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     if (!g_metal_active || !g_rt_tex || !out || !w || !h) return -1;
     @autoreleasepool {
         flush_gpu();
+        /* Present commits the draw buffer without waiting, then commits the
+         * gamma pass on the same queue. Waiting on that last buffer (if any)
+         * guarantees the draw that produced this render target has finished;
+         * otherwise getBytes can read a stale target while the GPU still
+         * works (the gamma_ramp pixel test saw 0 instead of the drawn gray). */
+        if (g_present_cb) {
+            [g_present_cb waitUntilCompleted];
+            [g_present_cb release];
+            g_present_cb = nil;
+        }
         MTLRegion region = MTLRegionMake2D(x, y, w, h);
         [msaa_resolved_texture() getBytes:out bytesPerRow:out_bytes_per_row fromRegion:region mipmapLevel:0];
     }

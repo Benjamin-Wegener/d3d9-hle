@@ -174,6 +174,77 @@
 #define D3DUSAGE_NPATCHES                   0x00000100u
 #define D3DUSAGE_SOFTWAREPROCESSING         0x00000010u
 
+/* Public D3D9 render-state values beyond the ones defined above in
+ * d3d9_idirect3ddevice9.c (Wine 11.0 include/d3d9types.h). */
+#define D3DCMP_NEVER         1u
+#define D3DCMP_LESS          2u
+#define D3DCMP_EQUAL         3u
+#define D3DCMP_GREATER       5u
+#define D3DCMP_NOTEQUAL      6u
+#define D3DCMP_GREATEREQUAL  7u
+#define D3DCMP_ALWAYS        8u
+/* D3DBLEND values (public; D3DBLEND_SRCCOLOR2/INVSRCCOLOR2 are 9EX-only). */
+#define D3DBLEND_ZERO        1u
+#define D3DBLEND_ONE         2u
+#define D3DBLEND_SRCCOLOR    3u
+#define D3DBLEND_INVSRCCOLOR 4u
+#define D3DBLEND_DESTALPHA   7u
+#define D3DBLEND_INVDESTALPHA 8u
+#define D3DBLEND_DESTCOLOR   9u
+#define D3DBLEND_INVDESTCOLOR 10u
+#define D3DBLEND_SRCALPHASAT 11u
+#define D3DBLEND_BOTHSRCALPHA 12u
+#define D3DBLEND_BOTHINVSRCALPHA 13u
+#define D3DBLEND_BLENDFACTOR 14u
+#define D3DBLEND_INVBLENDFACTOR 15u
+#define D3DBLENDOP_ADD       1u
+#define D3DBLENDOP_SUBTRACT  2u
+#define D3DBLENDOP_REVSUBTRACT 3u
+#define D3DBLENDOP_MIN       4u
+#define D3DBLENDOP_MAX       5u
+#define D3DSTENCILOP_KEEP    1u
+#define D3DSTENCILOP_ZERO    2u
+#define D3DSTENCILOP_REPLACE 3u
+#define D3DSTENCILOP_INCRSAT 4u
+#define D3DSTENCILOP_DECRSAT 5u
+#define D3DSTENCILOP_INVERT  6u
+#define D3DSTENCILOP_INCR    7u
+#define D3DSTENCILOP_DECR    8u
+/* New D3DRS_* values (public; Wine 11.0 include/d3d9types.h). */
+#define D3DRS_STENCILENABLE            52u
+#define D3DRS_STENCILFAIL              53u
+#define D3DRS_STENCILZFAIL             54u
+#define D3DRS_STENCILPASS              55u
+#define D3DRS_STENCILFUNC              56u
+#define D3DRS_STENCILREF               57u
+#define D3DRS_STENCILMASK              58u
+#define D3DRS_STENCILWRITEMASK         59u
+#define D3DRS_SLOPESCALEDEPTHBIAS    175u
+#define D3DRS_BLENDOP                 171u
+#define D3DRS_COLORWRITEENABLE        168u
+#define D3DRS_DEPTHBIAS               195u
+#define D3DRS_TWOSIDEDSTENCILMODE     185u
+#define D3DRS_CCW_STENCILFAIL         186u
+#define D3DRS_CCW_STENCILZFAIL        187u
+#define D3DRS_CCW_STENCILPASS         188u
+#define D3DRS_CCW_STENCILFUNC         189u
+#define D3DRS_COLORWRITEENABLE1       190u
+#define D3DRS_COLORWRITEENABLE2       191u
+#define D3DRS_COLORWRITEENABLE3       192u
+#define D3DRS_SEPARATEALPHABLENDENABLE 206u
+#define D3DRS_SRCBLENDALPHA           207u
+#define D3DRS_DESTBLENDALPHA          208u
+#define D3DRS_BLENDOPALPHA            209u
+#define D3DRS_ALPHATESTENABLE 15u
+#define D3DRS_ALPHAFUNC       25u
+#define D3DRS_ALPHAREF        24u
+#define D3DRS_ZFUNC           23u
+#define D3DRS_SRCBLEND        19u
+#define D3DRS_DESTBLEND       20u
+#define D3DBLEND_SRCALPHA     5u
+#define D3DBLEND_INVSRCALPHA  6u
+#define D3DCMP_LESSEQUAL      4u
+
 /* D3DSWAPEFFECT */
 #define D3DSWAPEFFECT_DISCARD               1u
 #define D3DSWAPEFFECT_FLIP                  2u
@@ -366,6 +437,44 @@ typedef struct {
 typedef struct {
     float m[4][4];
 } D3DMATRIX;
+
+typedef struct {
+    float r, g, b, a;
+} D3DCOLORVALUE;
+
+typedef struct {
+    float x, y, z;
+} D3DVECTOR;
+
+typedef enum {
+    D3DLIGHT_POINT       = 1,
+    D3DLIGHT_SPOT        = 2,
+    D3DLIGHT_DIRECTIONAL = 3
+} D3DLIGHTTYPE;
+
+typedef struct {
+    D3DLIGHTTYPE    Type;
+    D3DCOLORVALUE   Diffuse;
+    D3DCOLORVALUE   Specular;
+    D3DCOLORVALUE   Ambient;
+    D3DVECTOR       Position;
+    D3DVECTOR       Direction;
+    float           Range;
+    float           Falloff;
+    float           Attenuation0;
+    float           Attenuation1;
+    float           Attenuation2;
+    float           Theta;
+    float           Phi;
+} D3DLIGHT9;
+
+typedef struct {
+    D3DCOLORVALUE   Diffuse;
+    D3DCOLORVALUE   Ambient;
+    D3DCOLORVALUE   Specular;
+    D3DCOLORVALUE   Emissive;
+    float           Power;
+} D3DMATERIAL9;
 
 /* 304 bytes exact */
 typedef struct {

@@ -37,6 +37,7 @@ typedef struct { uint32_t n; param_t p[MAX_PARAMS]; } pool_t;
 #define POOL(o) ((pool_t *)((char *)hle_ptr(o) + 8))
 
 static uint32_t g_vt;
+static uint32_t g_vt_effect;
 
 static param_t *find(pool_t *pool, const char *name, int create) {
     if (!name) return 0;
@@ -213,9 +214,63 @@ typedef struct {
     uint32_t shaders_created, shaders_live;  /* device shader objects made / still held */
     fxstate_t state[MAX_STATES];             /* render + sampler states */
     uint32_t nstate;
+    uint32_t blocks;                         /* first parameter block (guest VA) */
+    uint32_t recording;                      /* open parameter block, 0 = none */
 } effect_t;
 #define EFFECT(o) ((effect_t *)((char *)hle_ptr(o) + 8))
-static uint32_t g_vt_effect;
+
+/* A parameter block records the values of the parameters changed through this
+ * effect between BeginParameterBlock and EndParameterBlock. The handle given
+ * to the guest is the guest VA of one of these blocks; they are kept in a
+ * per-effect list so a foreign handle can be rejected by comparing addresses
+ * before anything is dereferenced. */
+#define PARAMBLOCK_MAGIC 0x424D5042u /* 'BMPB' */
+typedef struct {
+    uint32_t magic;
+    uint32_t id;
+    uint32_t next;               /* guest VA of the next block, 0 ends the list */
+    uint32_t nrec;               /* number of recorded values */
+    param_t rec[MAX_PARAMS];     /* one snapshot per changed parameter */
+} paramblock_t;
+
+static uint32_t g_paramblock_id;
+
+static paramblock_t *pb_from_handle(const effect_t *e, uint32_t h) {
+    uint32_t cur;
+    if (!e || !h) return 0;
+    for (cur = e->blocks; cur; ) {
+        paramblock_t *b = (paramblock_t *)hle_ptr(cur);
+        if (!b) return 0;
+        if (cur == h) return b->magic == PARAMBLOCK_MAGIC ? b : 0;
+        cur = b->next;
+    }
+    return 0;
+}
+
+static void pb_record(effect_t *e, const param_t *p) {
+    paramblock_t *b;
+    uint32_t i;
+    if (!e || !e->recording || !p) return;
+    b = (paramblock_t *)hle_ptr(e->recording);
+    if (!b || b->magic != PARAMBLOCK_MAGIC) return;
+    for (i = 0; i < b->nrec; i++)
+        if (!strcmp(b->rec[i].name, p->name)) { b->rec[i] = *p; return; }
+    if (b->nrec < MAX_PARAMS) b->rec[b->nrec++] = *p;
+}
+
+static void pb_free_list(effect_t *e) {
+    uint32_t cur;
+    if (!e) return;
+    cur = e->blocks;
+    while (cur) {
+        paramblock_t *b = (paramblock_t *)hle_ptr(cur);
+        if (!b) break;
+        cur = b->next;
+        hle_free(b);
+    }
+    e->blocks = 0;
+    e->recording = 0;
+}
 
 /* ---- IDirect3DDevice9 vtable slots (in the order d3d9.c registers them) ---- */
 enum {
@@ -258,11 +313,11 @@ static int ct_register(uint32_t ct, const char *name, uint32_t *idx, uint32_t *c
     void *desc = hle_alloc(48);
     uint32_t *pcount = (uint32_t *)hle_alloc(4);
     if (!desc || !pcount) { if (desc) hle_free(desc); if (pcount) hle_free(pcount); return 0; }
-    MEM32(pcount) = 0;
+    MEM32(hle_va(pcount)) = 0;
     uint32_t rc = hle_call_guest(hle_resolve("ID3DXConstantTable::GetConstantDesc"), 4,
                                  (uint32_t[]){ ct, h, hle_va(desc), hle_va(pcount) });
     int ok = 0;
-    if (rc == D3D_OK && MEM32(pcount) >= 1u) {
+    if (rc == D3D_OK && MEM32(hle_va(pcount)) >= 1u) {
         uint32_t *d = (uint32_t *)desc;
         if (d[1] == D3DXRS_FLOAT4 && d[2] < 256u) {
             *idx = d[2];
@@ -490,6 +545,7 @@ static void e_set_float(void) {              /* (this, parameter handle, value) 
     if (!h) RET(D3DERR_INVALIDCALL, 3);
     param_t *p = (param_t *)hle_ptr(h);
     p->type = PT_FLOAT, p->f[0] = f32(A32(2));
+    pb_record(EFFECT(A32(0)), p);
     RET(D3D_OK, 3);
 }
 static void e_set_vector(void) {           /* (this, handle, const float4*) */
@@ -498,6 +554,7 @@ static void e_set_vector(void) {           /* (this, handle, const float4*) */
     if (!p || !v) RET(D3DERR_INVALIDCALL, 3);
     p->type = PT_VECTOR;
     memcpy(p->f, hle_ptr(v), 16);
+    pb_record(EFFECT(A32(0)), p);
     RET(D3D_OK, 3);
 }
 static void e_get_float(void) {
@@ -513,6 +570,7 @@ static void e_set_texture(void) {
     if (!h) RET(D3DERR_INVALIDCALL, 3);
     param_t *p = (param_t *)hle_ptr(h);
     p->type = PT_TEXTURE, p->tex = A32(2);
+    pb_record(EFFECT(A32(0)), p);
     RET(D3D_OK, 3);
 }
 static void e_get_texture(void) {
@@ -530,6 +588,7 @@ static void e_release(void) {
     if (!n) {
         effect_t *e = EFFECT(self);
         release_shaders(e);
+        pb_free_list(e);
         if (e->device) hle_call_guest(MEM32(MEM32(e->device) + 8u), 1, (uint32_t[]){ e->device });
         hle_com_free(self);
     }
@@ -559,9 +618,203 @@ static void e_get_pool(void) {
 static void e_on_lost(void) { hle_d3d9fx_effect_on_lost(A32(0)); RET(D3D_OK, 1); }
 static void e_on_reset(void) { RET(D3D_OK, 1); }
 
+/* ---- ID3DXEffect methods added for this task ----
+ * Signatures and order follow Wine's include/d3dx9effect.h, ID3DXEffect with
+ * D3DX_SDK_VERSION >= 27. Every method has exactly one RET with the stdcall
+ * argument count of its header declaration (this included). Base slots this
+ * HLE does not implement keep the logging stubs in d3dx9_fxvtbl.c. */
+
+/* BeginParameterBlock(): starts recording; Wine declares an HRESULT return. */
+static void e_begin_paramblock(void) {
+    uint32_t hr = D3DERR_INVALIDCALL;
+    uint32_t self = A32(0);
+    effect_t *e = self ? EFFECT(self) : 0;
+    if (e && !e->recording) {
+        paramblock_t *b = (paramblock_t *)hle_alloc(sizeof *b);
+        if (b) {
+            memset(b, 0, sizeof *b);
+            b->magic = PARAMBLOCK_MAGIC;
+            b->id = ++g_paramblock_id;
+            e->recording = hle_va(b);
+            hr = D3D_OK;
+        } else hr = 0x8007000Eu; /* E_OUTOFMEMORY */
+    }
+    RET(hr, 1);
+}
+
+/* EndParameterBlock(): returns the handle of the finished block. */
+static void e_end_paramblock(void) {
+    uint32_t h = 0;
+    uint32_t self = A32(0);
+    effect_t *e = self ? EFFECT(self) : 0;
+    if (e && e->recording) {
+        paramblock_t *b = (paramblock_t *)hle_ptr(e->recording);
+        if (b && b->magic == PARAMBLOCK_MAGIC) {
+            b->next = e->blocks;
+            e->blocks = e->recording;
+            h = e->recording;
+        }
+        e->recording = 0;
+    }
+    RET(h, 1);
+}
+
+/* ApplyParameterBlock(this, handle): replay the recorded values. */
+static void e_apply_paramblock(void) {
+    uint32_t hr = D3DERR_INVALIDCALL;
+    uint32_t self = A32(0);
+    effect_t *e = self ? EFFECT(self) : 0;
+    paramblock_t *b = pb_from_handle(e, A32(1));
+    if (b && b->nrec) {
+        pool_t *pool = POOL(e->pool);
+        uint32_t i;
+        if (pool) {
+            for (i = 0; i < b->nrec; i++) {
+                param_t *src = &b->rec[i], *dst = find(pool, src->name, 1);
+                if (!dst) break;
+                dst->type = src->type;
+                memcpy(dst->f, src->f, sizeof dst->f);
+                dst->tex = src->tex;
+                dst->stage = src->stage;
+            }
+            if (i == b->nrec) hr = D3D_OK;
+        }
+    }
+    RET(hr, 2);
+}
+
+/* DeleteParameterBlock(this, handle): unlink and free one of our blocks. */
+static void e_delete_paramblock(void) {
+    uint32_t hr = D3DERR_INVALIDCALL;
+    uint32_t self = A32(0), h = A32(1);
+    effect_t *e = self ? EFFECT(self) : 0;
+    paramblock_t *b = pb_from_handle(e, h);
+    if (b) {
+        uint32_t *link = e ? &e->blocks : 0;
+        while (link && *link && *link != h) {
+            paramblock_t *cur = (paramblock_t *)hle_ptr(*link);
+            if (!cur) break;
+            link = &cur->next;
+        }
+        if (link && *link == h) *link = b->next;
+        if (e && e->recording == h) e->recording = 0;
+        hle_free(b);
+        hr = D3D_OK;
+    }
+    RET(hr, 2);
+}
+
+/* ValidateTechnique(this, handle): a D3DXHANDLE identifies a technique by
+ * address; it is never an array index. */
+static void e_validate_technique(void) {
+    uint32_t hr = D3DERR_INVALIDCALL;
+    uint32_t self = A32(0), h = A32(1);
+    effect_t *e = self ? EFFECT(self) : 0;
+    if (e && h) {
+        for (uint32_t i = 0; i < e->ntech; i++)
+            if (hle_va(&e->tech[i]) == h) { hr = D3D_OK; break; }
+    }
+    RET(hr, 2);
+}
+
+/* FindNextValidTechnique(this, handle, &next): a NULL handle asks for the
+ * first technique. Every technique in this HLE is valid; with no more, the
+ * out handle is NULL and S_FALSE is returned (Wine). */
+static void e_find_next_valid_technique(void) {
+    uint32_t hr = D3DERR_INVALIDCALL;
+    uint32_t self = A32(0), h = A32(1), out = A32(2);
+    effect_t *e = self ? EFFECT(self) : 0;
+    if (e && out) {
+        uint32_t start = 0;
+        int valid = 1;
+        if (h) {
+            valid = 0;
+            for (uint32_t i = 0; i < e->ntech; i++)
+                if (hle_va(&e->tech[i]) == h) { start = i + 1; valid = 1; break; }
+        }
+        if (valid) {
+            if (start < e->ntech) { MEM32(out) = hle_va(&e->tech[start]); hr = D3D_OK; }
+            else { MEM32(out) = 0; hr = 1u; /* S_FALSE */ }
+        }
+    }
+    RET(hr, 3);
+}
+
+/* CloneEffect(this, device, &out): the device is required and the clone
+ * shares the source pool, with its own copy of the techniques and states. */
+static void e_clone_effect(void) {
+    uint32_t hr = D3DERR_INVALIDCALL;
+    uint32_t self = A32(0), dev = A32(1), out = A32(2);
+    effect_t *src = self ? EFFECT(self) : 0;
+    if (src && dev && out) {
+        uint32_t clone = hle_d3d9fx_effect_new(src->pool);
+        if (clone) {
+            effect_t *dst = EFFECT(clone);
+            for (uint32_t i = 0; i < src->ntech; i++) {
+                const char *passes[MAX_PASS] = { 0 };
+                for (uint32_t j = 0; j < src->tech[i].npass; j++)
+                    passes[j] = (const char *)hle_ptr(src->tech[i].pass[j]);
+                hle_d3d9fx_effect_add_tech_ct(clone, src->tech[i].name, passes,
+                    src->tech[i].npass, src->tech[i].vs, src->tech[i].ps,
+                    src->tech[i].vs_ct, src->tech[i].ps_ct);
+            }
+            for (uint32_t i = 0; i < src->nstate; i++)
+                hle_d3d9fx_effect_add_state(clone, src->state[i].kind, src->state[i].stage,
+                    src->state[i].state, src->state[i].value, src->state[i].tech,
+                    src->state[i].pass);
+            hle_d3d9fx_effect_set_device(clone, dev);
+            dst->current = src->current;
+            MEM32(out) = clone;
+            hr = D3D_OK;
+        } else hr = 0x8007000Eu; /* E_OUTOFMEMORY */
+    }
+    RET(hr, 3);
+}
+
+static uint32_t param_data_size(const param_t *p) {
+    if (!p) return 0;
+    if (p->type == PT_VECTOR) return 16;
+    if (p->type == PT_MATRIX) return 64;
+    return 4;
+}
+
+/* A parameter handle is a guest VA into the shared pool. Compare addresses
+ * instead of dereferencing an unchecked guest value. */
+static param_t *effect_param(const effect_t *e, uint32_t h) {
+    pool_t *pool;
+    if (!e || !h) return 0;
+    pool = POOL(e->pool);
+    if (!pool) return 0;
+    for (uint32_t i = 0; i < pool->n; i++)
+        if (hle_va(&pool->p[i]) == h) return &pool->p[i];
+    return 0;
+}
+
+/* SetRawValue(this, parameter, data, byte_offset, bytes). */
+static void e_set_raw_value(void) {
+    uint32_t hr = D3DERR_INVALIDCALL;
+    uint32_t self = A32(0), h = A32(1), data = A32(2), off = A32(3), bytes = A32(4);
+    effect_t *e = self ? EFFECT(self) : 0;
+    param_t *p = effect_param(e, h);
+    if (p && data) {
+        if (p->type == PT_TEXTURE) {
+            if (off == 0 && bytes == 4) { p->tex = MEM32(data); hr = D3D_OK; }
+        } else {
+            uint32_t total = param_data_size(p);
+            if (off <= total && bytes <= total - off) {
+                memcpy((char *)p->f + off, hle_ptr(data), bytes);
+                hr = D3D_OK;
+            }
+        }
+        if (hr == D3D_OK) pb_record(e, p);
+    }
+    RET(hr, 5);
+}
+
 /* Implemented methods; every other slot of the public 79-slot layout comes from
  * d3dx9_fxvtbl.c as a logged "not supported". */
 static const win32hle_shim effect_impl[] = {
+    { "GetPool", e_get_pool },
     { "QueryInterface", d3d_QueryInterface },
     { "AddRef", hle_com_AddRef },
     { "Release", e_release },
@@ -576,8 +829,17 @@ static const win32hle_shim effect_impl[] = {
     { "SetFloat", e_set_float }, { "GetFloat", e_get_float },
     { "SetTexture", e_set_texture }, { "GetTexture", e_get_texture },
     { "SetVector", e_set_vector },
-    { "GetDevice", e_get_device }, { "GetPool", e_get_pool },
-    { "OnLostDevice", e_on_lost }, { "OnResetDevice", e_on_reset },
+    { "GetDevice", e_get_device },
+    { "OnLostDevice", e_on_lost },
+    { "OnResetDevice", e_on_reset },
+    { "ValidateTechnique", e_validate_technique },
+    { "FindNextValidTechnique", e_find_next_valid_technique },
+    { "BeginParameterBlock", e_begin_paramblock },
+    { "EndParameterBlock", e_end_paramblock },
+    { "ApplyParameterBlock", e_apply_paramblock },
+    { "DeleteParameterBlock", e_delete_paramblock },
+    { "CloneEffect", e_clone_effect },
+    { "SetRawValue", e_set_raw_value },
     { 0, 0 }
 };
 

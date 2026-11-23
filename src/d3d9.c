@@ -434,5 +434,13 @@ static void s_Direct3DCreate9(void) {
 const win32hle_shim win32hle_d3d9[] = {
     { "d3d9.dll#Direct3DCreate9", s_Direct3DCreate9 },
     { "Direct3DCreate9", s_Direct3DCreate9 },
+    /* PIX profiling exports: public Wine 11.0 include/d3d9.h, WINAPI stdcall. */
+    { "D3DPERF_BeginEvent", perf_BeginEvent },
+    { "D3DPERF_EndEvent", perf_EndEvent },
+    { "D3DPERF_SetMarker", perf_SetMarker },
+    { "D3DPERF_SetRegion", perf_SetRegion },
+    { "D3DPERF_QueryRepeatFrame", perf_QueryRepeatFrame },
+    { "D3DPERF_SetOptions", perf_SetOptions },
+    { "D3DPERF_GetStatus", perf_GetStatus },
     { 0, 0 }
 };

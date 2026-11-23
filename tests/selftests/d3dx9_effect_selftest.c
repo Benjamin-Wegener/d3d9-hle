@@ -29,8 +29,9 @@ static uint32_t esp0;
     } while (0)
 
 static uint32_t V_create;
-static uint32_t g_out, g_name_time, g_name_count, g_name_flag, g_name_light;
+static uint32_t g_out, g_out2, g_name_time, g_name_count, g_name_flag, g_name_light;
 static uint32_t g_name_world, g_name_tex, g_name_missing, g_name_base, g_name_lighting;
+static uint32_t g_name_tech0, g_name_tech1;
 static uint32_t g_val, g_vec, g_mat;
 
 static uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
@@ -194,6 +195,166 @@ static void shader_lifetime_tests(void) {
     ok("after the application's Release every shader is free", g_live == 0u);
 }
 
+/* Minimal fake device for CloneEffect: only AddRef/Release are called by the HLE. */
+static void m_clone_qi(void) { RET(0u, 3); }
+static void m_clone_addref(void) { RET(1u, 1); }
+static void m_clone_release(void) { RET(0u, 1); }
+static const win32hle_shim clone_dev_shims[] = {
+    { "CloneFake::QueryInterface", m_clone_qi },
+    { "CloneFake::AddRef", m_clone_addref },
+    { "CloneFake::Release", m_clone_release },
+    { 0, 0 }
+};
+
+/* The slots added for the effect-pool task. All expected values below were
+ * written down before running the code: handle identity, 7.25f restored by a
+ * parameter block, S_FALSE after the last technique, and so on. */
+static void effect_pool_slot_tests(uint32_t pool) {
+    uint32_t _cf = 0; uint32_t _flag_k = FK_NONE; uint32_t _flag_a = 0, _flag_b = 0;
+    uint32_t a = hle_d3d9fx_effect_new(pool), b = hle_d3d9fx_effect_new(pool);
+    uint32_t ha = 0, hb = 0, t0 = 0, t1 = 0, pb = 0, clone = 0, dev;
+    const char *passes[] = { "P0", "P1" };
+    ok("two effects for one pool", a != 0 && b != 0);
+    if (!a || !b) return;
+    win32hle_register(clone_dev_shims);
+    dev = hle_com_new(hle_com_vtable(clone_dev_shims), 8);
+    ok("fake device for CloneEffect", dev != 0);
+
+    /* A shared pool parameter must be the very same handle in both effects. */
+    XCALL(method(a, 9), 3, a, 0u, g_name_time);
+    ha = eax;
+    XCALL(method(b, 9), 3, b, 0u, g_name_time);
+    hb = eax;
+    ok("both effects resolve the shared parameter", ha != 0 && ha == hb);
+    XCALL(method(a, 30), 3, a, ha, fbits(3.5f));
+    ok("shared parameter set through effect A", eax == 0u);
+    MEM32(g_val) = 0;
+    XCALL(method(b, 31), 3, b, hb, g_val);
+    ok("effect B reads 3.5f from the shared pool", eax == 0u && as_float(MEM32(g_val)) == 3.5f);
+
+    /* Two techniques, then their handles/validation/iteration. */
+    ok("technique T0 added", hle_d3d9fx_effect_add_tech(a, "T0", passes, 2) == 1);
+    ok("technique T1 added", hle_d3d9fx_effect_add_tech(a, "T1", passes, 2) == 2);
+    XCALL(method(a, 13), 2, a, g_name_tech0);
+    t0 = eax;
+    XCALL(method(a, 13), 2, a, g_name_tech1);
+    t1 = eax;
+    ok("technique handles are distinct", t0 != 0 && t1 != 0 && t0 != t1);
+    XCALL(method(a, 60), 2, a, t0);
+    ok("ValidateTechnique accepts a real handle", eax == 0u);
+    XCALL(method(a, 60), 2, a, 0xDEADBEEFu);
+    ok("ValidateTechnique rejects a bogus handle", eax == D3DERR_INVALIDCALL);
+    MEM32(g_out2) = 0xAAAAAAAAu;
+    XCALL(method(a, 61), 3, a, 0u, g_out2);
+    ok("FindNextValidTechnique(NULL) returns T0", eax == 0u && MEM32(g_out2) == t0);
+    XCALL(method(a, 61), 3, a, t0, g_out2);
+    ok("FindNextValidTechnique(T0) returns T1", eax == 0u && MEM32(g_out2) == t1);
+    MEM32(g_out2) = 0xAAAAAAAAu;
+    XCALL(method(a, 61), 3, a, t1, g_out2);
+    ok("no further technique gives S_FALSE and NULL", eax == 1u && MEM32(g_out2) == 0u);
+    XCALL(method(a, 61), 3, a, 0xDEADBEEFu, g_out2);
+    ok("FindNextValidTechnique rejects a bogus handle", eax == D3DERR_INVALIDCALL);
+
+    /* Begin/set/End records 7.25f; after changing it to 9.5f, Apply must
+     * restore 7.25f in both effects because the pool is shared. */
+    XCALL(method(a, 73), 1, a);
+    ok("BeginParameterBlock", eax == 0u);
+    XCALL(method(a, 73), 1, a);
+    ok("a second BeginParameterBlock fails", eax == D3DERR_INVALIDCALL);
+    XCALL(method(a, 30), 3, a, ha, fbits(7.25f));
+    ok("recorded SetFloat", eax == 0u);
+    XCALL(method(a, 74), 1, a);
+    pb = eax;
+    ok("EndParameterBlock returns a handle", pb != 0u);
+    XCALL(method(a, 74), 1, a);
+    ok("EndParameterBlock without Begin returns 0", eax == 0u);
+    XCALL(method(a, 30), 3, a, ha, fbits(9.5f));
+    ok("change after End", eax == 0u);
+    XCALL(method(a, 75), 2, a, pb);
+    ok("ApplyParameterBlock", eax == 0u);
+    MEM32(g_val) = 0;
+    XCALL(method(b, 31), 3, b, hb, g_val);
+    ok("effect B sees the restored 7.25f", eax == 0u && as_float(MEM32(g_val)) == 7.25f);
+    XCALL(method(a, 75), 2, a, 0xDEADBEEFu);
+    ok("ApplyParameterBlock rejects a bogus handle", eax == D3DERR_INVALIDCALL);
+    XCALL(method(a, 76), 2, a, pb);
+    ok("DeleteParameterBlock", eax == 0u);
+    XCALL(method(a, 75), 2, a, pb);
+    ok("ApplyParameterBlock after Delete fails", eax == D3DERR_INVALIDCALL);
+
+    /* An empty block is not applicable; Begin/End must still balance. */
+    XCALL(method(a, 73), 1, a);
+    ok("BeginParameterBlock for the empty block", eax == 0u);
+    XCALL(method(a, 74), 1, a);
+    pb = eax;
+    ok("empty block has a handle", pb != 0u);
+    XCALL(method(a, 75), 2, a, pb);
+    ok("empty block cannot be applied", eax == D3DERR_INVALIDCALL);
+    XCALL(method(a, 76), 2, a, pb);
+    ok("empty block deleted", eax == 0u);
+
+    /* CloneEffect writes an out handle, returns an HRESULT and keeps the pool. */
+    MEM32(g_out2) = 0;
+    XCALL(method(a, 77), 3, a, 0u, g_out2);
+    ok("CloneEffect with no device fails", eax == D3DERR_INVALIDCALL && MEM32(g_out2) == 0u);
+    XCALL(method(a, 77), 3, a, dev, 0u);
+    ok("CloneEffect with no out pointer fails", eax == D3DERR_INVALIDCALL);
+    MEM32(g_out2) = 0;
+    XCALL(method(a, 77), 3, a, dev, g_out2);
+    ok("CloneEffect returns D3D_OK", eax == 0u);
+    clone = MEM32(g_out2);
+    ok("clone is a different object", clone != 0 && clone != a);
+    XCALL(method(clone, 9), 3, clone, 0u, g_name_time);
+    ok("clone resolves the same pool parameter", eax == ha);
+    XCALL(method(clone, 13), 2, clone, g_name_tech0);
+    ok("clone kept the technique", eax != 0u);
+    MEM32(g_out2) = 0;
+    XCALL(method(clone, 68), 2, clone, g_out2);
+    ok("clone reports the requested device", eax == 0u && MEM32(g_out2) == dev);
+
+    /* SetRawValue(this, param, data, byte_offset, bytes). */
+    MEM32(g_val) = fbits(4.75f);
+    XCALL(method(a, 78), 5, a, ha, g_val, 0u, 4u);
+    ok("SetRawValue writes 4.75f", eax == 0u);
+    MEM32(g_val) = 0;
+    XCALL(method(a, 31), 3, a, ha, g_val);
+    ok("GetFloat sees 4.75f", eax == 0u && as_float(MEM32(g_val)) == 4.75f);
+    MEM32(g_val) = fbits(4.75f);
+    XCALL(method(a, 78), 5, a, ha, g_val, 4u, 4u);
+    ok("SetRawValue rejects an out-of-range offset", eax == D3DERR_INVALIDCALL);
+    XCALL(method(a, 78), 5, a, ha, g_val, 0u, 8u);
+    ok("SetRawValue rejects too many bytes", eax == D3DERR_INVALIDCALL);
+    XCALL(method(a, 78), 5, a, 0xDEADBEEFu, g_val, 0u, 4u);
+    ok("SetRawValue rejects a bogus handle", eax == D3DERR_INVALIDCALL);
+    /* The vector parameter was set to 1,2,3,4 by effect_tests. */
+    XCALL(method(a, 9), 3, a, 0u, g_name_light);
+    ha = eax;
+    MEM32(g_val) = fbits(6.5f);
+    XCALL(method(a, 78), 5, a, ha, g_val, 8u, 4u);
+    ok("SetRawValue writes vector component 2", eax == 0u);
+    memset(hle_ptr(g_vec), 0, 16);
+    hle_call_guest(hle_resolve("d3dx9fx_host::PoolGetVector"), 3,
+                   (uint32_t[]){ pool, g_name_light, g_vec });
+    ok("vector is 1,2,6.5,4", as_float(MEM32(g_vec)) == 1.0f && as_float(MEM32(g_vec + 4)) == 2.0f &&
+        as_float(MEM32(g_vec + 8)) == 6.5f && as_float(MEM32(g_vec + 12)) == 4.0f);
+
+    /* The remaining effect slots requested by the task, and the honest
+     * not-found answer of the annotation slot. */
+    XCALL(method(a, 69), 1, a);
+    ok("OnLostDevice via the guest vtable", eax == 0u);
+    XCALL(method(a, 70), 1, a);
+    ok("OnResetDevice via the guest vtable", eax == 0u);
+    XCALL(method(a, 18), 3, a, 0u, 0u);   /* GetAnnotation: base slot 18 */
+    ok("GetAnnotation reports not found", eax == 0u);
+
+    XCALL(method(clone, 2), 1, clone);
+    ok("clone Release", eax == 0u);
+    XCALL(method(b, 2), 1, b);
+    ok("effect B Release", eax == 0u);
+    XCALL(method(a, 2), 1, a);
+    ok("effect A Release", eax == 0u);
+}
+
 static void guest(void) {
     uint32_t _cf = 0; uint32_t _flag_k = FK_NONE; uint32_t _flag_a = 0, _flag_b = 0;
     uint32_t pool, m[15];
@@ -285,6 +446,7 @@ static void guest(void) {
     ok("six parameters stored", hle_d3d9fx_pool_values(pool) == 6u);
 
     effect_tests(pool);
+    effect_pool_slot_tests(pool);
 
     XCALL(m[2], 1, pool);                               /* 2 -> 1 */
     ok("Release to one", eax == 1u);
@@ -302,6 +464,7 @@ int main(void) {
     ok("D3DXCreateEffectPool resolves", V_create != 0);
 
     g_out = hle_va(hle_alloc(4));
+    g_out2 = hle_va(hle_alloc(4));
     g_name_time = guest_str("Time");
     g_name_count = guest_str("Count");
     g_name_flag = guest_str("Flag");
@@ -311,6 +474,8 @@ int main(void) {
     g_name_missing = guest_str("Missing");
     g_name_base = guest_str("Base");
     g_name_lighting = guest_str("Lighting");
+    g_name_tech0 = guest_str("T0");
+    g_name_tech1 = guest_str("T1");
     g_val = hle_va(hle_alloc(4));
     g_vec = hle_va(hle_alloc(16));
     g_mat = hle_va(hle_alloc(64));

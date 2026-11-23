@@ -749,7 +749,10 @@ int main(void) {
 
     /* DrawPrimitive */
     uint32_t a_draw[4] = { dev, D3DPT_TRIANGLELIST, 0, 1 };
-    ok("DrawPrimitive hr == 0", call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3D_OK);
+    {
+        uint32_t hr14 = call("IDirect3DDevice9::DrawPrimitive", 4, a_draw);
+        ok("DrawPrimitive hr == 0", hr14 == D3D_OK);
+    }
 
     uint32_t a_escene[1] = { dev };
     ok("EndScene hr == 0", call("IDirect3DDevice9::EndScene", 1, a_escene) == D3D_OK);
@@ -877,6 +880,48 @@ int main(void) {
          * with the real backend this is the MTLDevice working-set size. */
         ok("GetAvailableTextureMem is stable", mem0 == mem1);
         ok("GetAvailableTextureMem is not the old constant 1 GiB", mem0 != 1024u * 1024u * 1024u);
+
+        /* ShowCursor returns the previous state (public D3D9 contract). */
+        ok("ShowCursor(FALSE) returns initial 1",
+           call("IDirect3DDevice9::ShowCursor", 2, (uint32_t[]){ dev, 0 }) == 1u);
+        ok("ShowCursor(FALSE) again returns 0",
+           call("IDirect3DDevice9::ShowCursor", 2, (uint32_t[]){ dev, 0 }) == 0u);
+        ok("ShowCursor(TRUE) returns previous 0",
+           call("IDirect3DDevice9::ShowCursor", 2, (uint32_t[]){ dev, 1 }) == 0u);
+        ok("ShowCursor(TRUE) again returns 1",
+           call("IDirect3DDevice9::ShowCursor", 2, (uint32_t[]){ dev, 1 }) == 1u);
+
+        /* D3DPERF_* are plain stdcall exports, no `this`. The public Wine
+         * 11.0 d3d9.h signatures fix the argument counts and return types. */
+        uint32_t *wname = (uint32_t *)hle_alloc(32);
+        memset(wname, 0, 32);
+        const char *ascii = "selftest";
+        for (int i = 0; ascii[i]; i++) ((uint16_t *)wname)[i] = (uint16_t)ascii[i];
+        /* Public docs (learn.microsoft.com D3DPERF_BeginEvent/EndEvent) and
+         * Wine 11.0 d3d9_main.c: BeginEvent returns the zero-based level it
+         * starts in (post-increment), EndEvent the level it ends in
+         * (pre-decrement) -- negative on an unmatched end. */
+        uint32_t tok1 = call("D3DPERF_BeginEvent", 2, (uint32_t[]){ 0x11223344u, A(wname) });
+        uint32_t tok2 = call("D3DPERF_BeginEvent", 2, (uint32_t[]){ 0, A(wname) });
+        ok("BeginEvent first level is 0", tok1 == 0u);
+        ok("BeginEvent second level is 1", tok2 == 1u);
+        ok("QueryRepeatFrame is FALSE",
+           call("D3DPERF_QueryRepeatFrame", 0, (uint32_t[]){ 0 }) == 0u);
+        ok("GetStatus is 0 (no profiler)",
+           call("D3DPERF_GetStatus", 0, (uint32_t[]){ 0 }) == 0u);
+        ok("EndEvent returns level 1",
+           call("D3DPERF_EndEvent", 0, (uint32_t[]){ 0 }) == 1u);
+        ok("EndEvent returns level 0",
+           call("D3DPERF_EndEvent", 0, (uint32_t[]){ 0 }) == 0u);
+        ok("EndEvent unmatched returns -1",
+           call("D3DPERF_EndEvent", 0, (uint32_t[]){ 0 }) == 0xFFFFFFFFu);
+        /* Restore the level for any later tests that use the counter. */
+        call("D3DPERF_BeginEvent", 2, (uint32_t[]){ 0, A(wname) });
+        /* void-returning markers: only the stdcall pop is observable here. */
+        call("D3DPERF_SetMarker", 2, (uint32_t[]){ 0, A(wname) });
+        call("D3DPERF_SetRegion", 2, (uint32_t[]){ 0, A(wname) });
+        call("D3DPERF_SetOptions", 1, (uint32_t[]){ 1 });
+        ok("void D3DPERF markers kept the machine alive", 1);
     }
 
     /* 17. Pure state: Set stores, Get returns the same bytes/value. */
@@ -900,6 +945,19 @@ int main(void) {
 
         void *light = hle_alloc(104), *light_out = hle_alloc(104);
         memset(light, 0x11, 104); memset(light_out, 0, 104);
+        /* GetLight on unassigned light index -> D3DERR_INVALIDCALL */
+        ok("GetLight on unassigned light -> D3DERR_INVALIDCALL",
+           call("IDirect3DDevice9::GetLight", 3, (uint32_t[]){ dev, 5, A(light_out) }) == D3DERR_INVALIDCALL);
+        /* Light index >= 8 (D3D9_MAX_LIGHTS) -> D3DERR_INVALIDCALL */
+        ok("SetLight index 8 -> D3DERR_INVALIDCALL",
+           call("IDirect3DDevice9::SetLight", 3, (uint32_t[]){ dev, 8, A(light) }) == D3DERR_INVALIDCALL);
+        ok("GetLight index 8 -> D3DERR_INVALIDCALL",
+           call("IDirect3DDevice9::GetLight", 3, (uint32_t[]){ dev, 8, A(light_out) }) == D3DERR_INVALIDCALL);
+        ok("LightEnable index 8 -> D3DERR_INVALIDCALL",
+           call("IDirect3DDevice9::LightEnable", 3, (uint32_t[]){ dev, 8, 1 }) == D3DERR_INVALIDCALL);
+        ok("GetLightEnable index 8 -> D3DERR_INVALIDCALL",
+           call("IDirect3DDevice9::GetLightEnable", 3, (uint32_t[]){ dev, 8, A(light_out) }) == D3DERR_INVALIDCALL);
+        /* Valid SetLight/GetLight */
         uint32_t a_slight[3] = { dev, 2, A(light) };
         ok("SetLight == D3D_OK", call("IDirect3DDevice9::SetLight", 3, a_slight) == D3D_OK);
         uint32_t a_glight[3] = { dev, 2, A(light_out) };
@@ -1246,7 +1304,225 @@ int main(void) {
         call("IDirect3DSurface9::Release", 1, (uint32_t[]){ *saved_rt });
     }
 
-    /* 19. Cleanup & Release */
+    /* 19. Alpha test, stencil, depth bias, blend op, separate alpha, color write */
+    {
+        uint32_t a_draw[4] = { dev, D3DPT_TRIANGLELIST, 0, 1 };
+        uint32_t *rs_out = (uint32_t *)hle_alloc(4);
+        struct { uint32_t rs; uint32_t val; } rt[] = {
+            { D3DRS_ALPHAFUNC, D3DCMP_LESS },
+            { D3DRS_ALPHAREF, 128 },
+            { D3DRS_STENCILFAIL, D3DSTENCILOP_REPLACE },
+            { D3DRS_STENCILZFAIL, D3DSTENCILOP_INCRSAT },
+            { D3DRS_STENCILPASS, D3DSTENCILOP_DECR },
+            { D3DRS_STENCILFUNC, D3DCMP_EQUAL },
+            { D3DRS_STENCILREF, 0xAB },
+            { D3DRS_STENCILMASK, 0x3C },
+            { D3DRS_STENCILWRITEMASK, 0x7F },
+            { D3DRS_BLENDOP, D3DBLENDOP_MAX },
+            { D3DRS_SEPARATEALPHABLENDENABLE, 1 },
+            { D3DRS_SRCBLENDALPHA, D3DBLEND_INVSRCALPHA },
+            { D3DRS_DESTBLENDALPHA, D3DBLEND_ONE },
+            { D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD },
+            { D3DRS_COLORWRITEENABLE, 0x3 },
+            { D3DRS_COLORWRITEENABLE1, 0xC },
+            { D3DRS_COLORWRITEENABLE2, 0x5 },
+            { D3DRS_COLORWRITEENABLE3, 0xA },
+        };
+        for (size_t i = 0; i < sizeof rt / sizeof rt[0]; i++) {
+            char msg[96];
+            call("IDirect3DDevice9::SetRenderState", 3,
+                 (uint32_t[]){ dev, rt[i].rs, rt[i].val });
+            call("IDirect3DDevice9::GetRenderState", 3,
+                 (uint32_t[]){ dev, rt[i].rs, A(rs_out) });
+            snprintf(msg, sizeof msg, "Set/GetRenderState(%u) roundtrip", rt[i].rs);
+            ok(msg, *rs_out == rt[i].val);
+        }
+        /* Restore supported defaults for the states tested above. */
+        struct { uint32_t rs; uint32_t val; } rst[] = {
+            { D3DRS_ALPHAFUNC, D3DCMP_ALWAYS },
+            { D3DRS_ALPHAREF, 0 },
+            { D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP },
+            { D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP },
+            { D3DRS_STENCILPASS, D3DSTENCILOP_KEEP },
+            { D3DRS_STENCILFUNC, D3DCMP_ALWAYS },
+            { D3DRS_STENCILREF, 0 },
+            { D3DRS_STENCILMASK, 0xFF },
+            { D3DRS_STENCILWRITEMASK, 0xFF },
+            { D3DRS_BLENDOP, D3DBLENDOP_ADD },
+            { D3DRS_SEPARATEALPHABLENDENABLE, 0 },
+            { D3DRS_SRCBLENDALPHA, D3DBLEND_SRCALPHA },
+            { D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA },
+            { D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD },
+            { D3DRS_COLORWRITEENABLE, 0xF },
+            { D3DRS_COLORWRITEENABLE1, 0xF },
+            { D3DRS_COLORWRITEENABLE2, 0xF },
+            { D3DRS_COLORWRITEENABLE3, 0xF },
+        };
+        for (size_t i = 0; i < sizeof rst / sizeof rst[0]; i++)
+            call("IDirect3DDevice9::SetRenderState", 3,
+                 (uint32_t[]){ dev, rst[i].rs, rst[i].val });
+
+        /* Float-valued states (DEPTHBIAS, SLOPESCALEDDEPTHBIAS): stored as
+         * float bits, like the Depth Bias page ("cast the value to a DWORD"). */
+        float fv = 2.5f, sv = -0.5f;
+        uint32_t fb, sb;
+        memcpy(&fb, &fv, 4); memcpy(&sb, &sv, 4);
+        ok("SetRenderState(DEPTHBIAS) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_DEPTHBIAS, fb }) == D3D_OK);
+        call("IDirect3DDevice9::GetRenderState", 3,
+             (uint32_t[]){ dev, D3DRS_DEPTHBIAS, A(rs_out) });
+        ok("GetRenderState(DEPTHBIAS) == 2.5f bits", *rs_out == fb);
+        ok("SetRenderState(SLOPESCALEDDEPTHBIAS) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SLOPESCALEDEPTHBIAS, sb }) == D3D_OK);
+        call("IDirect3DDevice9::GetRenderState", 3,
+             (uint32_t[]){ dev, D3DRS_SLOPESCALEDEPTHBIAS, A(rs_out) });
+        ok("GetRenderState(SLOPESCALEDDEPTHBIAS) == -0.5f bits", *rs_out == sb);
+        call("IDirect3DDevice9::SetRenderState", 3,
+             (uint32_t[]){ dev, D3DRS_DEPTHBIAS, 0 });
+        call("IDirect3DDevice9::SetRenderState", 3,
+             (uint32_t[]){ dev, D3DRS_SLOPESCALEDEPTHBIAS, 0 });
+
+        /* Invalid values: D3DERR_INVALIDCALL per the public docs. */
+        struct { uint32_t rs; uint32_t val; } bad[] = {
+            { D3DRS_SRCBLEND, 99 }, { D3DRS_DESTBLEND, 99 },
+            { D3DRS_ZFUNC, 0 }, { D3DRS_ZFUNC, 9 },
+            { D3DRS_ALPHAFUNC, 0 }, { D3DRS_ALPHAFUNC, 9 },
+            { D3DRS_STENCILFUNC, 0 }, { D3DRS_CCW_STENCILFUNC, 99 },
+            { D3DRS_BLENDOP, 42 },
+            { D3DRS_STENCILFAIL, 9 }, { D3DRS_STENCILPASS, 0 },
+            { D3DRS_CCW_STENCILZFAIL, 0 }, { D3DRS_CCW_STENCILPASS, 99 },
+            { D3DRS_COLORWRITEENABLE, 0x10 }, { D3DRS_COLORWRITEENABLE1, 0x20 },
+            { D3DRS_ALPHATESTENABLE, 2 },
+        };
+        for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            char msg[96];
+            snprintf(msg, sizeof msg, "SetRenderState(%u, 0x%x) invalid",
+                     bad[i].rs, bad[i].val);
+            ok(msg, call("IDirect3DDevice9::SetRenderState", 3,
+                         (uint32_t[]){ dev, bad[i].rs, bad[i].val }) == D3DERR_INVALIDCALL);
+        }
+
+        /* Honest draws: unsupported combinations report D3DERR_NOTAVAILABLE
+         * (Metal backend cannot apply them); supported ones stay D3D_OK.
+         * Every draw is preceded by a supported-state reset so the
+         * expectation is deterministic. */
+        ok("SetRenderState(STENCILENABLE,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_STENCILENABLE, 0 }) == D3D_OK);
+        ok("SetRenderState(DEPTHBIAS,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_DEPTHBIAS, 0 }) == D3D_OK);
+        ok("SetRenderState(SLOPESCALEDDEPTHBIAS,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SLOPESCALEDEPTHBIAS, 0 }) == D3D_OK);
+        ok("SetRenderState(COLORWRITEENABLE,0xF) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_COLORWRITEENABLE, 0xF }) == D3D_OK);
+        ok("SetRenderState(COLORWRITEENABLE1,0xF) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_COLORWRITEENABLE1, 0xF }) == D3D_OK);
+        ok("SetRenderState(BLENDOP,D3DBLENDOP_ADD) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_BLENDOP, D3DBLENDOP_ADD }) == D3D_OK);
+        ok("SetRenderState(SEPARATEALPHABLENDENABLE,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SEPARATEALPHABLENDENABLE, 0 }) == D3D_OK);
+        ok("DrawPrimitive == D3D_OK (supported state)",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3D_OK);
+
+        ok("SetRenderState(STENCILENABLE,1) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_STENCILENABLE, 1 }) == D3D_OK);
+        ok("DrawPrimitive with stencil == D3DERR_NOTAVAILABLE",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3DERR_NOTAVAILABLE);
+        ok("SetRenderState(STENCILENABLE,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_STENCILENABLE, 0 }) == D3D_OK);
+
+        ok("SetRenderState(DEPTHBIAS,float) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_DEPTHBIAS, fb }) == D3D_OK);
+        ok("DrawPrimitive with DEPTHBIAS != 0 == D3DERR_NOTAVAILABLE",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3DERR_NOTAVAILABLE);
+        ok("SetRenderState(DEPTHBIAS,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_DEPTHBIAS, 0 }) == D3D_OK);
+
+        ok("SetRenderState(SLOPESCALEDDEPTHBIAS,float) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SLOPESCALEDEPTHBIAS, sb }) == D3D_OK);
+        ok("DrawPrimitive with SLOPESCALEDDEPTHBIAS != 0 == D3DERR_NOTAVAILABLE",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3DERR_NOTAVAILABLE);
+        ok("SetRenderState(SLOPESCALEDDEPTHBIAS,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SLOPESCALEDEPTHBIAS, 0 }) == D3D_OK);
+
+        ok("SetRenderState(COLORWRITEENABLE,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_COLORWRITEENABLE, 0 }) == D3D_OK);
+        ok("DrawPrimitive with COLORWRITEENABLE == 0 == D3DERR_NOTAVAILABLE",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3DERR_NOTAVAILABLE);
+        ok("SetRenderState(COLORWRITEENABLE,0xF) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_COLORWRITEENABLE, 0xF }) == D3D_OK);
+        ok("SetRenderState(COLORWRITEENABLE1,0x8) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_COLORWRITEENABLE1, 0x8 }) == D3D_OK);
+        ok("DrawPrimitive with COLORWRITEENABLE1 == 0x8 == D3DERR_NOTAVAILABLE",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3DERR_NOTAVAILABLE);
+        ok("SetRenderState(COLORWRITEENABLE1,0xF) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_COLORWRITEENABLE1, 0xF }) == D3D_OK);
+
+        ok("SetRenderState(BLENDOP,SUBTRACT) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_BLENDOP, D3DBLENDOP_SUBTRACT }) == D3D_OK);
+        ok("DrawPrimitive with BLENDOP != ADD == D3DERR_NOTAVAILABLE",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3DERR_NOTAVAILABLE);
+        ok("SetRenderState(BLENDOP,ADD) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_BLENDOP, D3DBLENDOP_ADD }) == D3D_OK);
+
+        ok("SetRenderState(SEPARATEALPHABLENDENABLE,1) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SEPARATEALPHABLENDENABLE, 1 }) == D3D_OK);
+        ok("SetRenderState(SRCBLENDALPHA,D3DBLEND_INVSRCALPHA) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SRCBLENDALPHA, D3DBLEND_INVSRCALPHA }) == D3D_OK);
+        ok("DrawPrimitive with separate alpha != rgb == D3DERR_NOTAVAILABLE",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3DERR_NOTAVAILABLE);
+        ok("SetRenderState(SRCBLENDALPHA,D3DBLEND_SRCALPHA) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SRCBLENDALPHA, D3DBLEND_SRCALPHA }) == D3D_OK);
+        ok("SetRenderState(DESTBLENDALPHA,D3DBLEND_INVSRCALPHA) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA }) == D3D_OK);
+        ok("DrawPrimitive with separate alpha == rgb == D3D_OK",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3D_OK);
+        ok("SetRenderState(SEPARATEALPHABLENDENABLE,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_SEPARATEALPHABLENDENABLE, 0 }) == D3D_OK);
+
+        /* Alpha test is supported by the HLE's fixed-function pipeline. */
+        ok("SetRenderState(ALPHATESTENABLE,1) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_ALPHATESTENABLE, 1 }) == D3D_OK);
+        ok("SetRenderState(ALPHAFUNC,D3DCMP_LESS) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_ALPHAFUNC, D3DCMP_LESS }) == D3D_OK);
+        ok("SetRenderState(ALPHAREF,128) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_ALPHAREF, 128 }) == D3D_OK);
+        ok("DrawPrimitive with alpha test == D3D_OK",
+           call("IDirect3DDevice9::DrawPrimitive", 4, a_draw) == D3D_OK);
+        ok("SetRenderState(ALPHATESTENABLE,0) D3D_OK",
+           call("IDirect3DDevice9::SetRenderState", 3,
+                (uint32_t[]){ dev, D3DRS_ALPHATESTENABLE, 0 }) == D3D_OK);
+    }
+
+    /* 20. Cleanup & Release */
     uint32_t a_rel_q[1] = { *pQuery };
     call("IDirect3DQuery9::Release", 1, a_rel_q);
 

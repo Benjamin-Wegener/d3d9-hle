@@ -16,6 +16,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include "win32hle.h"
@@ -23,6 +24,7 @@
 #include "d3d9_format.h"
 #include "d3d9_internal.h"
 #include "d3dx9_surface.h"
+#include "d3dx9_buffer.h"
 
 #ifndef D3D_OK
 #define D3D_OK 0u
@@ -871,42 +873,35 @@ static int save_dds(const char *name, const D3DSURFACE_DESC *d,
 
 /* (file, fileformat, surface, palette, srcrect) -- 5 args. The 5th argument
  * is a RECT*, NOT a filter; there is no filter parameter on this function. */
-void s_D3DXSaveSurfaceToFileA(void) {
-    const char *name   = ASTR(0);
-    uint32_t ffmt      = A32(1);
-    uint32_t surf      = A32(2);
-    uint32_t palette   = A32(3);
-    uint32_t srect_va  = A32(4);
 
+static uint32_t d3dx_save_surface_to_file_host(const char *name, uint32_t ffmt, uint32_t surf, uint32_t palette, uint32_t srect_va) {
     if (!name || !is_surf9(surf)) {
-        log_err("SaveSurfaceToFileA: kein gültiges Oberflächen-Objekt");
-        RET(D3DERR_INVALIDCALL, 5);
+        log_err("SaveSurfaceToFileA: kein gueltiges Oberflaechen-Objekt");
+        return D3DERR_INVALIDCALL;
     }
     if (palette) {
-        log_err("SaveSurfaceToFileA: Palette nicht unterstützt");
-        RET(D3DERR_NOTAVAILABLE, 5);
+        log_err("SaveSurfaceToFileA: Palette nicht unterstuetzt");
+        return D3DERR_NOTAVAILABLE;
     }
     if (ffmt != D3DXIFF_BMP && ffmt != D3DXIFF_DDS) {
-        log_err("SaveSurfaceToFileA: Dateiformat nicht unterstützt");
-        RET(D3DERR_NOTAVAILABLE, 5);
+        log_err("SaveSurfaceToFileA: Dateiformat nicht unterstuetzt");
+        return D3DERR_NOTAVAILABLE;
     }
-
     D3DSURFACE_DESC desc;
     if (surf_get_desc(surf, &desc) != D3D_OK) {
         log_err("SaveSurfaceToFileA: GetDesc fehlgeschlagen");
-        RET(D3DERR_INVALIDCALL, 5);
+        return D3DERR_INVALIDCALL;
     }
     D3DRECT srect;
     int sempty;
     if (!surface_rect(srect_va, desc.Width, desc.Height, &srect, &sempty) || sempty) {
-        log_err("SaveSurfaceToFileA: ungültiges Quellrechteck");
-        RET(D3DERR_INVALIDCALL, 5);
+        log_err("SaveSurfaceToFileA: ungultiges Quellrechteck");
+        return D3DERR_INVALIDCALL;
     }
-
     D3DLOCKED_RECT lr;
     if (surf_lock_rect(surf, 0x10u, &lr) != D3D_OK || !lr.pBits) {
         log_err("SaveSurfaceToFileA: LockRect fehlgeschlagen");
-        RET(D3DERR_INVALIDCALL, 5);
+        return D3DERR_INVALIDCALL;
     }
     uint32_t x = (uint32_t)srect.x1, y = (uint32_t)srect.y1;
     uint32_t w = (uint32_t)(srect.x2 - srect.x1), h = (uint32_t)(srect.y2 - srect.y1);
@@ -915,5 +910,44 @@ void s_D3DXSaveSurfaceToFileA(void) {
         : save_dds(name, &desc, hle_ptr(lr.pBits), (uint32_t)lr.Pitch, x, y, w, h);
     surf_unlock_rect(surf);
     if (rc) log_err("SaveSurfaceToFileA: Schreiben fehlgeschlagen");
-    RET(rc == 0 ? D3D_OK : D3DERR_NOTAVAILABLE, 5);
+    return rc == 0 ? D3D_OK : D3DERR_NOTAVAILABLE;
+}
+
+void s_D3DXSaveSurfaceToFileA(void) {
+    const char *name   = ASTR(0);
+    uint32_t ffmt      = A32(1);
+    uint32_t surf      = A32(2);
+    uint32_t palette   = A32(3);
+    uint32_t srect_va  = A32(4);
+    uint32_t hr = d3dx_save_surface_to_file_host(name, ffmt, surf, palette, srect_va);
+    RET(hr, 5);
+}
+
+void s_D3DXSaveSurfaceToFileInMemory(void) {
+    uint32_t ppDestBuf = A32(0);
+    uint32_t ffmt      = A32(1);
+    uint32_t surf      = A32(2);
+    uint32_t palette   = A32(3);
+    uint32_t srect_va  = A32(4);
+    if (!ppDestBuf) { RET(D3DERR_INVALIDCALL, 5); }
+    char tmpname[128];
+    snprintf(tmpname, sizeof tmpname, "/tmp/d3dx_savesurf_%u.bin", (unsigned)time(NULL));
+    uint32_t hr = d3dx_save_surface_to_file_host(tmpname, ffmt, surf, palette, srect_va);
+    if (hr != D3D_OK) { remove(tmpname); RET(hr, 5); }
+    FILE *f = fopen(tmpname, "rb");
+    if (!f) { remove(tmpname); RET(D3DERR_NOTAVAILABLE, 5); }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); remove(tmpname); RET(D3DERR_NOTAVAILABLE, 5); }
+    void *data = malloc((size_t)sz);
+    if (!data) { fclose(f); remove(tmpname); RET(0x8007000Eu, 5); }
+    if (fread(data, 1, (size_t)sz, f) != (size_t)sz) { free(data); fclose(f); remove(tmpname); RET(D3DERR_NOTAVAILABLE, 5); }
+    fclose(f);
+    remove(tmpname);
+    uint32_t buf = d3dx9_buffer_new(data, (size_t)sz);
+    free(data);
+    if (!buf) { RET(0x8007000Eu, 5); }
+    MEM32(ppDestBuf) = buf;
+    RET(D3D_OK, 5);
 }

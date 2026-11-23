@@ -12,13 +12,13 @@ int main(void) {
     uint32_t dev = make_device();
     if (!dev) return 1;
 
-    /* A quad covering [-0.5, 0.5] in NDC (window coordinates 8..24 of 32x32) using TRIANGLEFAN:
+    /* A quad covering pixels 8..24 of the 32x32 target using TRIANGLEFAN:
      * v0 (center/start), v1, v2, v3 */
     VtxFVF v[4] = {
-        { -0.5f, -0.5f, 0.5f, 1.0f, 0xFF00FF00u },
-        {  0.5f, -0.5f, 0.5f, 1.0f, 0xFF00FF00u },
-        {  0.5f,  0.5f, 0.5f, 1.0f, 0xFF00FF00u },
-        { -0.5f,  0.5f, 0.5f, 1.0f, 0xFF00FF00u }
+        { 8.0f,  8.0f, 0.5f, 1.0f, 0xFF00FF00u },
+        { 24.0f, 8.0f, 0.5f, 1.0f, 0xFF00FF00u },
+        { 24.0f, 24.0f, 0.5f, 1.0f, 0xFF00FF00u },
+        { 8.0f,  24.0f, 0.5f, 1.0f, 0xFF00FF00u }
     };
 
     uint32_t vb_size = sizeof(v);

@@ -54,12 +54,25 @@ Tests run with a 60 second limit each; exit code 142 means a test hung.
 
 ## Known issues
 
-- `test_d3d9_gamma_ramp` is unreliable, especially under CPU load: it reads the
-  render target after `Present` and sometimes sees an empty or only-cleared
-  texture. This looks like a race between `Present`, the GPU and the read-back
-  in `src/d3d9_metal.m`. It is being tracked down.
 - Only the Metal backend exists, so rendering is macOS only. The selftests need
   no GPU and run anywhere SDL2 builds.
+- Vertex, index and instance buffers are copied when they are bound for a draw,
+  so that a later `Lock` cannot change a draw that has not reached the GPU yet.
+  That is correct but costs a copy per draw; a cheaper scheme is still open.
+
+## Recent changes
+
+- `Present` now shows the back buffer in the SDL window (a `CAMetalLayer`),
+  including the gamma ramp and scaling with `pSrcRect`/`pDestRect`; hidden
+  windows and the SDL dummy driver still render off-screen only.
+- Pre-transformed vertices (`D3DFVF_XYZRHW` / `POSITIONT`) use screen pixels
+  relative to the viewport, as documented; world, view and projection are not
+  applied to them.
+- Fixed a race between `Present` and reading back the render target
+  (`test_d3d9_gamma_ramp` is stable again).
+- More fixed-function coverage (lights, texture stage operations, texture
+  coordinate generation), alpha test and stencil, sampler address modes,
+  `ProcessVertices`, `D3DPERF_*`, effect pools and texture format conversion.
 
 ## Contributing
 

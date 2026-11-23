@@ -33,12 +33,12 @@ int main(void) {
     for (int i = 0; i < 4; i++) tex_pixels[i] = 0xFFFFFF00u;
     call("IDirect3DTexture9::UnlockRect", 2, (uint32_t[]){ *pTex, 0 });
 
-    /* Quad covering [-1, 1] NDC with cyan diffuse */
+    /* Quad covering the full 32x32 target with cyan diffuse */
     VtxTex v[4] = {
-        { -1.0f, -1.0f, 0.5f, 1.0f, 0xFF00FFFFu, 0.0f, 0.0f },
-        {  1.0f, -1.0f, 0.5f, 1.0f, 0xFF00FFFFu, 1.0f, 0.0f },
-        {  1.0f,  1.0f, 0.5f, 1.0f, 0xFF00FFFFu, 1.0f, 1.0f },
-        { -1.0f,  1.0f, 0.5f, 1.0f, 0xFF00FFFFu, 0.0f, 1.0f }
+        {  0.0f,  0.0f, 0.5f, 1.0f, 0xFF00FFFFu, 0.0f, 0.0f },
+        { 32.0f,  0.0f, 0.5f, 1.0f, 0xFF00FFFFu, 1.0f, 0.0f },
+        { 32.0f, 32.0f, 0.5f, 1.0f, 0xFF00FFFFu, 1.0f, 1.0f },
+        {  0.0f, 32.0f, 0.5f, 1.0f, 0xFF00FFFFu, 0.0f, 1.0f }
     };
 
     uint32_t vb_size = sizeof(v);

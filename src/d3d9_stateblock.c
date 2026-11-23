@@ -139,7 +139,10 @@ static void sb_hold(uint32_t *slot, uint32_t obj) {
     for (uint32_t i = 0; i < 512; i++)                                            \
         if (m->xform[i]) (D)->transforms[i] = (S)->transforms[i];                 \
     for (uint32_t i = 0; i < D3D9_MAX_LIGHTS; i++) {                              \
-        if (m->light[i]) memcpy((D)->lights[i], (S)->lights[i], D3D9_LIGHT_BYTES); \
+        if (m->light[i]) {                                                         \
+            memcpy((D)->lights[i], (S)->lights[i], D3D9_LIGHT_BYTES);              \
+            (D)->light_defined[i] = (S)->light_defined[i];                         \
+        }                                                                          \
         if (m->light_en[i]) (D)->light_enable[i] = (S)->light_enable[i];          \
     }                                                                             \
     for (uint32_t i = 0; i < D3D9_MAX_CLIP_PLANES; i++)                           \

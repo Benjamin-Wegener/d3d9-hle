@@ -160,6 +160,7 @@ typedef struct {
     uint8_t     material[D3D9_MATERIAL_BYTES];
     uint8_t     lights[D3D9_MAX_LIGHTS][D3D9_LIGHT_BYTES];
     uint32_t    light_enable[D3D9_MAX_LIGHTS];
+    uint8_t     light_defined[D3D9_MAX_LIGHTS];
     float       clip_planes[D3D9_MAX_CLIP_PLANES][4];
     uint8_t     palette[D3D9_MAX_PALETTES][D3D9_PALETTE_ENTRIES * 4];
     uint32_t    current_texture_palette;
@@ -200,6 +201,7 @@ typedef struct {
 
     /* Scene / state-block recording status */
     int         in_scene;
+    uint32_t    cursor_visible;  /* ShowCursor state: 1 at device creation */
     uint32_t    recording_state_block; /* nonzero between Begin/EndStateBlock */
     void       *sb_rec;            /* d3d9_sb_ctx_t: states set while recording */
     void       *sb_base;           /* d3d9_sb_ctx_t: device state at BeginStateBlock */
@@ -336,6 +338,7 @@ typedef struct {
     uint8_t     material[D3D9_MATERIAL_BYTES];
     uint8_t     lights[D3D9_MAX_LIGHTS][D3D9_LIGHT_BYTES];
     uint32_t    light_enable[D3D9_MAX_LIGHTS];
+    uint8_t     light_defined[D3D9_MAX_LIGHTS];
     float       clip_planes[D3D9_MAX_CLIP_PLANES][4];
     uint8_t     palette[D3D9_MAX_PALETTES][D3D9_PALETTE_ENTRIES * 4];
     uint32_t    current_texture_palette;
@@ -387,6 +390,15 @@ void dev9_GetCreationParameters(void);
 void dev9_SetCursorProperties(void);
 void dev9_SetCursorPosition(void);
 void dev9_ShowCursor(void);
+
+/* Public D3DPERF_* exports (stdcall, no this): Wine 11.0 include/d3d9.h. */
+void perf_BeginEvent(void);
+void perf_EndEvent(void);
+void perf_SetMarker(void);
+void perf_SetRegion(void);
+void perf_QueryRepeatFrame(void);
+void perf_SetOptions(void);
+void perf_GetStatus(void);
 void dev9_CreateAdditionalSwapChain(void);
 void dev9_GetSwapChain(void);
 void dev9_GetNumberOfSwapChains(void);

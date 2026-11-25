@@ -74,6 +74,28 @@ Tests run with a 60 second limit each; exit code 142 means a test hung.
   coordinate generation), alpha test and stencil, sampler address modes,
   `ProcessVertices`, `D3DPERF_*`, effect pools and texture format conversion.
 
+## How it was built
+
+This library was written almost entirely by AI coding agents, coordinated with
+[agent-dispatcher](https://github.com/Benjamin-Wegener/agent-dispatcher): one
+small Python file that hands out tasks, git worktrees and peer reviews to many
+agents at once and merges only what passes the tests. Every change here was
+reviewed by a second agent and merged only with green selftests.
+
+Rough numbers for the larger project this library comes from (recompiler, Win32
+host layer and this D3D9/D3DX9 layer), after about five days:
+
+| | |
+|---|---|
+| hand/agent-written code | about 200,000 lines (C, Python, tests, docs) |
+| commits | about 640, of which 280 merges |
+| tasks handed in / rejected in review / merged | about 320 / 140 / 160 |
+| average time from task to merge | about 40 minutes |
+| agent tokens used (estimate, middle scenario) | about 56 million |
+
+The token figure is a model-based estimate (tokens per task and review cycle),
+not a measurement; a low/high range is about 22 to 126 million.
+
 ## Contributing
 
 Open an issue or a pull request. Keep to the public Microsoft documentation as

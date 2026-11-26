@@ -1135,7 +1135,15 @@ void dev9_CreateVertexShader(void) {
     ctx->msl = (char *)malloc(16384);
     char err[256];
     if (d3d9_translate_shader_to_msl(tokens, count, 0, ctx->msl, 16384, err, sizeof(err)) != 0) {
-        T("VS translation note: %s\n", err);
+        /* A failed translation must not yield a shader object with empty MSL:
+         * that is a false OK and crashes later. Free the partial context and
+         * report D3DERR_INVALIDCALL (public D3D9: CreateVertexShader fails). */
+        fprintf(stderr, "[d3d9] CreateVertexShader: translation failed: %s\n", err);
+        free(ctx->tokens);
+        free(ctx->msl);
+        free(ctx);
+        MEM32(ppShader) = 0;
+        RET(D3DERR_INVALIDCALL, 3);
     }
 
     uint32_t o = hle_com_new(g_vt_vs9, 16);
@@ -1168,7 +1176,14 @@ void dev9_CreatePixelShader(void) {
     ctx->msl = (char *)malloc(16384);
     char err[256];
     if (d3d9_translate_shader_to_msl(tokens, count, 1, ctx->msl, 16384, err, sizeof(err)) != 0) {
-        T("PS translation note: %s\n", err);
+        /* No shader object with empty MSL (false OK / later crash): free the
+         * partial context and report D3DERR_INVALIDCALL. */
+        fprintf(stderr, "[d3d9] CreatePixelShader: translation failed: %s\n", err);
+        free(ctx->tokens);
+        free(ctx->msl);
+        free(ctx);
+        MEM32(ppShader) = 0;
+        RET(D3DERR_INVALIDCALL, 3);
     }
 
     uint32_t o = hle_com_new(g_vt_ps9, 16);

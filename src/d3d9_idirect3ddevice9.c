@@ -44,7 +44,7 @@ __attribute__((weak)) void hle_d3d9_metal_set_present_params(const int32_t src[4
 #define D3DRS_SCISSORTESTENABLE 174u
 #define D3DBLEND_SRCALPHA     5u
 #define D3DBLEND_INVSRCALPHA  6u
-#define D3DCULL_NONE          0u
+#define D3DCULL_NONE          1u
 #define D3DCMP_LESSEQUAL      4u
 
 /* Texture stage state indices */
@@ -440,6 +440,7 @@ void dev9_Reset(void) {
     ctx->render_states[D3DRS_COLORWRITEENABLE1] = 0xFu;
     ctx->render_states[D3DRS_COLORWRITEENABLE2] = 0xFu;
     ctx->render_states[D3DRS_COLORWRITEENABLE3] = 0xFu;
+    ctx->render_states[D3DRS_CULLMODE] = 3u /* D3DCULL_CCW */;
     if (ctx->dynamic_ib && hle_d3d9_gpu && hle_d3d9_gpu->destroy_buffer) {
         hle_d3d9_gpu->destroy_buffer(ctx->dynamic_ib);
         ctx->dynamic_ib = NULL;
@@ -2579,7 +2580,10 @@ void dev9_ProcessVertices(void) {
                     float z_range = ctx->viewport.MaxZ - ctx->viewport.MinZ;
                     float x_ndc = 2.0f * (out[0] - (float)ctx->viewport.X) / (float)ctx->viewport.Width - 1.0f;
                     float y_ndc = 1.0f - 2.0f * (out[1] - (float)ctx->viewport.Y) / (float)ctx->viewport.Height;
-                    float z_ndc = z_range != 0.0f ? 2.0f * (out[2] - ctx->viewport.MinZ) / z_range - 1.0f : 2.0f * out[2] - 1.0f;
+                    /* D3D9 (like Metal) clips z in [0, 1]; the OpenGL-style
+                     * 2*z-1 remap made every pre-transformed z < 0.5 vanish. */
+                    float z_ndc = z_range != 0.0f ?
+                                  (out[2] - ctx->viewport.MinZ) / z_range : out[2];
                     r[0] = x_ndc * w_clip;
                     r[1] = y_ndc * w_clip;
                     r[2] = z_ndc * w_clip;
@@ -2596,6 +2600,16 @@ void dev9_ProcessVertices(void) {
                     break;
                 }
         }
+    }
+    /* ProcessVertices writes the destination VB without a guest Lock/Unlock,
+     * so the backend's GPU buffer would keep the old bytes. Upload the range
+     * we just produced, exactly as vb9_Unlock does. */
+    if (dvb->gpu_buf && hle_d3d9_gpu && hle_d3d9_gpu->upload_buffer) {
+        uint32_t off = dst_index * dstride, len = count * dstride;
+        uint32_t bytes = dvb->desc.Size ? dvb->desc.Size : 16;
+        if (off > bytes) off = bytes;
+        if (off + len > bytes) len = bytes - off;
+        if (len) hle_d3d9_gpu->upload_buffer(dvb->gpu_buf, off, dvb->data + off, len);
     }
     RET(D3D_OK, 7);
 }

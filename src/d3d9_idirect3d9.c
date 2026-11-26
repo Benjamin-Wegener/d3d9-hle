@@ -162,6 +162,8 @@ void d9_CreateDevice(void) {
     ctx->render_states[D3DRS_COLORWRITEENABLE1] = 0xFu;
     ctx->render_states[D3DRS_COLORWRITEENABLE2] = 0xFu;
     ctx->render_states[D3DRS_COLORWRITEENABLE3] = 0xFu;
+    /* Public D3D9 default: D3DRS_CULLMODE = D3DCULL_CCW (3), not 0. */
+    ctx->render_states[22u /* D3DRS_CULLMODE */] = 3u /* D3DCULL_CCW */;
     ctx->d3d9_obj = self;
     ctx->cursor_visible = 1;
     ctx->adapter = adapter;

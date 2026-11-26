@@ -61,6 +61,12 @@ static uint32_t make_device(void) {
                        (uint32_t[]){ d3d9, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, 0,
                                      D3DCREATE_HARDWARE_VERTEXPROCESSING, A(pp), A(pDev) });
     if (hr != D3D_OK || !*pDev) { ok("CreateDevice", 0); return 0; }
+    /* These tests exercise clip planes, fog, gamma etc., not culling. D3D9's
+     * device default is D3DCULL_CCW; set NONE explicitly so their triangles are
+     * not culled by the correct default. The default itself has its own test
+     * (test_d3d9_cull_default.c). */
+    call("IDirect3DDevice9::SetRenderState", 3,
+         (uint32_t[]){ *pDev, 22 /* D3DRS_CULLMODE */, 1 /* D3DCULL_NONE */ });
     return *pDev;
 }
 
@@ -68,7 +74,7 @@ static uint32_t make_vb(uint32_t dev, const Vtx *v, uint32_t n) {
     uint32_t bytes = (uint32_t)(sizeof(Vtx) * n);
     uint32_t *pVB = (uint32_t *)hle_alloc(4);
     call("IDirect3DDevice9::CreateVertexBuffer", 7,
-         (uint32_t[]){ 0, bytes, 0, 0, D3DPOOL_MANAGED, A(pVB), 0 });
+         (uint32_t[]){ dev, bytes, 0, 0, D3DPOOL_MANAGED, A(pVB), 0 });
     if (!*pVB) { ok("CreateVertexBuffer", 0); return 0; }
     uint32_t *pData = (uint32_t *)hle_alloc(4);
     call("IDirect3DVertexBuffer9::Lock", 5, (uint32_t[]){ *pVB, 0, bytes, A(pData), 0 });

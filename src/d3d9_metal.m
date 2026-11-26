@@ -30,6 +30,7 @@ static id<MTLCommandBuffer> g_curr_cmd_buf = nil;
 static id<MTLCommandBuffer> g_pending_draw_cb = nil;
 static id<MTLRenderCommandEncoder> g_curr_encoder = nil;
 static void flush_gpu(void);
+int hle_d3d9_metal_begin_scene(void);
 
 /* Occlusion queries: one shared MTLBuffer bound as every render pass's
  * visibilityResultBuffer. Each query owns an 8-byte slot; Metal writes a
@@ -273,8 +274,10 @@ static MTLCompareFunction depth_compare(uint32_t d3d) {
 }
 
 static MTLCullMode cull_mode(uint32_t d3d) {
-    if (d3d == 1) return MTLCullModeFront;   /* D3DCULL_CW */
-    if (d3d == 2) return MTLCullModeBack;    /* D3DCULL_CCW */
+    /* Public D3DCULL: NONE = 1, CW = 2, CCW = 3. Metal's front face is the
+     * clockwise one by default, so culling CW means culling the front. */
+    if (d3d == 2) return MTLCullModeFront;   /* D3DCULL_CW */
+    if (d3d == 3) return MTLCullModeBack;    /* D3DCULL_CCW */
     return MTLCullModeNone;
 }
 
@@ -712,6 +715,10 @@ void hle_d3d9_metal_shutdown_device(void) {
 int hle_d3d9_metal_clear(uint32_t flags, uint32_t color, float z, uint32_t stencil) {
     (void)stencil;
     if (!g_metal_active || !g_rt_tex) return 0;
+    /* A Metal clear needs its own render pass. D3D9 allows Clear between
+     * BeginScene and EndScene, so the scene's encoder is reopened below;
+     * without it every later draw of the scene would be dropped. */
+    int in_scene = g_curr_encoder != nil;
 
     @autoreleasepool {
         if (g_curr_encoder) {
@@ -747,6 +754,7 @@ int hle_d3d9_metal_clear(uint32_t flags, uint32_t color, float z, uint32_t stenc
         id<MTLRenderCommandEncoder> enc = [g_curr_cmd_buf renderCommandEncoderWithDescriptor:rpd];
         [enc endEncoding];
     }
+    if (in_scene) hle_d3d9_metal_begin_scene();
     return 0;
 }
 

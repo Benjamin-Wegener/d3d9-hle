@@ -321,6 +321,25 @@ int main(void) {
              (uint32_t[]){ dev, 174u, 0 });
     }
 
+    /* ── Test 8: z over the whole D3D range 0..1 is visible ─────────── */
+    {
+        /* Pre-transformed z is already a depth value in 0..1 (0 = near, the
+         * usual z of 2D drawing); none of it may be clipped away. */
+        static const float zs[3] = { 0.0f, 0.25f, 1.0f };
+        static const char *const what[3] = { "XYZRHW z=0 visible", "XYZRHW z=0.25 visible", "XYZRHW z=1 visible" };
+        for (int k = 0; k < 3; k++) {
+            clear64(dev, 0xFF000000u);
+            XYZW v[6] = {
+                {0,0,zs[k],1, 0xFFFF00FFu}, {64,0,zs[k],1, 0xFFFF00FFu}, {64,64,zs[k],1, 0xFFFF00FFu},
+                {0,0,zs[k],1, 0xFFFF00FFu}, {64,64,zs[k],1, 0xFFFF00FFu}, {0,64,zs[k],1, 0xFFFF00FFu},
+            };
+            upload_xyzw(dev, v, 6, FVF_XYZW);
+            draw_trilist(dev);
+            read64(px);
+            ok(what[k], px[32 * 64 + 32] == 0xFFFF00FFu);
+        }
+    }
+
     printf(fails == 0 ? "test_d3d9_xyzrhw: OK\n" : "test_d3d9_xyzrhw: FAILED\n");
     return fails ? 1 : 0;
 }

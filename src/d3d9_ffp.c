@@ -189,12 +189,12 @@ int d3d9_ffp_generate(const d3d9_ffp_desc_t *desc, char **out_msl, size_t *out_l
         if (has_rhw) {
             /* XYZRHW: x,y are screen pixels, z is depth, w is rhw (1/w).
              * Convert to clip-space: x_ndc=2*(x-X)/W-1, y_ndc=1-2*(y-Y)/H,
-             * z_ndc=2*(z-MinZ)/(MaxZ-MinZ)-1, w_clip=1/rhw. */
+             * w_clip=1/rhw. Pre-transformed z is already the depth value in
+             * 0..1, which is also Metal's clip range: pass it through. */
             sb_add(&s, "  float w_clip = in.pos.w != 0.0 ? 1.0 / in.pos.w : 1.0;\n");
             sb_add(&s, "  float x_ndc = 2.0 * (in.pos.x - u.viewportXYWH.x) / u.viewportXYWH.z - 1.0;\n");
             sb_add(&s, "  float y_ndc = 1.0 - 2.0 * (in.pos.y - u.viewportXYWH.y) / u.viewportXYWH.w;\n");
-            sb_add(&s, "  float z_range = u.viewportZ.y - u.viewportZ.x;\n");
-            sb_add(&s, "  float z_ndc = z_range != 0.0 ? 2.0 * (in.pos.z - u.viewportZ.x) / z_range - 1.0 : 2.0 * in.pos.z - 1.0;\n");
+            sb_add(&s, "  float z_ndc = in.pos.z;\n");
             sb_add(&s, "  o.pos = float4(x_ndc * w_clip, y_ndc * w_clip, z_ndc * w_clip, w_clip);\n");
         } else
             sb_add(&s, "  o.pos = u.mvp * in.pos;\n");
